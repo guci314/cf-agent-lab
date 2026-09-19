@@ -1,4 +1,11 @@
 {
+  "name": "cf-agent-lab",
+  "private": true,
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite build && wrangler dev",
+    "deploy": "vite build && wrangler deploy"
+  },
   "dependencies": {
     "@ai-sdk/openai-compatible": "^3.0.52",
     "@ai-sdk/react": "^4.0.109",
