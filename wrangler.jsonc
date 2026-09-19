@@ -1,0 +1,43 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cf-agent-lab",
+  "main": "src/server.ts",
+  "compatibility_date": "2026-09-18",
+  "compatibility_flags": ["nodejs_compat"],
+  // ⚠️ 一旦配了 routes，wrangler 会**默认把 workers.dev 关掉**（实测部署后
+  // cf-agent-lab.guci.workers.dev 变 404）。要两个域名都活着就必须显式写这一行。
+  "workers_dev": true,
+  // custom_domain: true 让 Cloudflare 自动建 DNS 记录 + 签证书，不用手动加 CNAME。
+  // 和 erp.yujizi.org 同一套写法（同一个 zone）。
+  "routes": [
+    {
+      "pattern": "agent.yujizi.org",
+      "custom_domain": true
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ChatAgent",
+        "class_name": "ChatAgent"
+      }
+    ]
+  },
+  "assets": {
+    "directory": "dist",
+    "binding": "ASSETS",
+    // ⚠️ 必须让 Worker 先接所有请求。默认行为是「静态文件优先于 Worker」——
+    // 那样 `/` 和 `/assets/*.js` 会被平台直接发出去，密码门根本盖不到它们，
+    // 只有 /api 和 /agents 受保护。开了这个才能真正"没过门什么都拿不到"。
+    "run_worker_first": true
+  },
+  "exports": {
+    "ChatAgent": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
+  "observability": {
+    "enabled": true
+  }
+}

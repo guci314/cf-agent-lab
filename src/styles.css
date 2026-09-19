@@ -1,0 +1,357 @@
+/* ── 设计令牌 ──────────────────────────────────────────────────────────
+   主题：这是一个**代码阅读工具**，不是聊天应用。它的价值不在回答的
+   文字里，而在**出处**（path:line）。所以整套视觉只有一个 bold 元素：
+   出处。其余一律安静。
+
+   色板刻意避开三类 AI 默认：暖奶油 #F4F1EA + 陶土色 #D97757、
+   近黑 + 荧光绿、以及 SaaS 卡片套件。底色是**冷灰蓝**，强调色是
+   **钴蓝**——蓝是引注/超链的颜色，而这个应用做的就是「指向源码」。 */
+:root {
+  color-scheme: light;
+
+  --paper: #eef0f4;
+  --sheet: #ffffff;
+  --ink: #14171c;
+  --ink-soft: #5b6472;
+  --rule: #dadfe6;
+  --pen: #1b3aa6;        /* 引用、焦点、仓库内工具 */
+  --pen-wash: #e9edfa;   /* 引用块的底 */
+  --pen-fill: #1b3aa6;   /* 实心按钮底 */
+  --on-pen: #ffffff;
+  --you-bg: #14171c;     /* 用户消息：你的话是墨块 */
+  --you-ink: #f4f5f7;
+  --chip: #eef0f4;       /* 行内代码的底 */
+  --warn: #8a5a00;
+  --danger: #a32318;
+
+  /* 只有两个圆角，各有理由：控件 3px 是工具感，纸张 10px 是容器 */
+  --radius-ctl: 3px;
+  --radius-sheet: 10px;
+
+  /* 中文字体子集动辄 5–10MB，而本应用的语料上限才 4MB —— 为 UI 加载
+     比内容还大的字体不合理。所以用系统栈，这是取舍不是偷懒。 */
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --paper: #0e1014;
+    --sheet: #161920;
+    --ink: #e7e9ed;
+    --ink-soft: #949caa;
+    --rule: #262b33;
+    --pen: #8fa8ff;        /* 暗底上要提亮才够对比 */
+    --pen-wash: #1b2440;
+    --pen-fill: #2543b8;   /* 但实心按钮底不能跟着提亮，否则白字读不出 */
+    --on-pen: #ffffff;
+    --you-bg: #2b313b;
+    --you-ink: #e7e9ed;
+    --chip: #20242c;
+    --warn: #e0a94a;
+    --danger: #f08a80;
+  }
+}
+
+* { box-sizing: border-box; }
+
+::selection { background: var(--pen); color: var(--on-pen); }
+
+/* ── 页面骨架：app shell ────────────────────────────────────────────────
+   顶栏与控制区固定，**只有对话区滚动**，输入框永远贴着底边。
+   这样「手机上发送框被挤出屏幕」不是靠断点补出来的，而是布局本身的结果。 */
+body {
+  margin: 0;
+  height: 100vh;
+  height: 100dvh;          /* vh 把手机地址栏也算进去，dvh 才是真正看得见的高度 */
+  overflow: hidden;
+  padding: 20px 16px;
+  padding-bottom: calc(20px + env(safe-area-inset-bottom));
+  padding-left: max(16px, env(safe-area-inset-left));
+  padding-right: max(16px, env(safe-area-inset-right));
+  background: var(--paper);
+  color: var(--ink);
+  font: 15px/1.62 var(--sans);
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* ⚠️ 居中和 stretch 必须挂在 #root 上，不能挂在 body 上。
+   Vue/React 的挂载点是一个额外的 div：body 的 flex 子项是 **#root** 而不是 .app，
+   而 #root 是普通 block、宽高都由内容决定（shrink-to-fit）。于是 .app 的
+   width:100% 拿到的是那个缩水的宽度，height 更是塌成内容高度 ——
+   表现就是「整块内容挤在左上角、纸张只有一百来像素高」。
+   把 #root 变成 flex 容器，.app 才是真正的 flex 子项，宽高各归其位。 */
+#root {
+  height: 100%;
+  display: flex;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.app {
+  width: 100%;
+  max-width: 760px;
+  min-height: 0;           /* 不加这行，flex 子项的默认 min-height:auto 会拒绝收缩 */
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* ── 顶栏 ─────────────────────────────────────────────────────────────
+   副标题只说一件事：这个页面是干什么的。不列工具名、不写技术栈——
+   「read / ls / grep / find」是实现的词汇，不是用户的词汇。 */
+header { flex: 0 0 auto; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+h1 { font-size: 18px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+.sub { color: var(--ink-soft); font-size: 12.5px; }
+
+/* ── 控制区（安静的行内 chrome，不是卡片）──────────────────────────── */
+.meta {
+  flex: 0 0 auto;
+  display: flex; gap: 14px; flex-wrap: wrap; align-items: center;
+  font-size: 12px; color: var(--ink-soft);
+}
+.meta label { display: flex; align-items: center; gap: 6px; }
+.meta input {
+  font: inherit; font-size: 12px; padding: 3px 8px; width: 130px;
+  border: 1px solid var(--rule); border-radius: var(--radius-ctl);
+  background: var(--sheet); color: var(--ink);
+}
+
+/* ── 对话纸张 ─────────────────────────────────────────────────────────
+   唯一的容器。flex:1 + min-height:0 让它吃掉剩余高度并内部滚动。 */
+.log {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sheet);
+  background: var(--sheet);
+  padding: 20px;
+  display: flex; flex-direction: column; gap: 18px;
+}
+
+/* 助手：**不开气泡**，就是纸上的散文。它通常很长，开气泡只会把可用宽度吃掉。
+   用户：深墨块，"你的话是墨，回答是纸"——转录里一眼就能扫到自己在哪问的。 */
+.msg { max-width: 100%; overflow-wrap: anywhere; white-space: pre-wrap; }
+
+.msg.bot { color: var(--ink); }
+
+.msg.user {
+  align-self: flex-end;
+  max-width: 82%;
+  padding: 9px 13px;
+  background: var(--you-bg);
+  color: var(--you-ink);
+  border-radius: var(--radius-sheet) var(--radius-sheet) var(--radius-ctl)
+    var(--radius-sheet);  /* 右下角收窄，指向说话的人 */
+  white-space: pre-wrap;
+}
+
+/* ── 正文里的两种"代码" ──────────────────────────────────────────────
+   层级很清楚：普通行内代码是中性底色，**「路径:行号」是钴蓝**——因为它是
+   这个产品存在的理由。两者的区别是信息，不是装饰。 */
+.inline-code,
+.cite {
+  font-family: var(--mono);
+  font-size: 0.9em;
+  padding: 1px 4px;
+  border-radius: var(--radius-ctl);
+}
+.inline-code { background: var(--chip); color: var(--ink); }
+.cite { background: var(--pen-wash); color: var(--pen); font-weight: 600; }
+
+/* 墨块上的代码不能再用钴蓝 —— 深底上读不出来，改成半透明白 */
+.msg.user .inline-code,
+.msg.user .cite {
+  background: rgba(255, 255, 255, 0.14);
+  color: var(--you-ink);
+  font-weight: 400;
+}
+
+/* ── 出处槽（本设计的唯一 bold 元素）─────────────────────────────────
+   │1 read   src/server.ts
+   │2 grep   createServer
+
+   这里的编号不是「01/02/03」装饰：工具调用**确实是序列**——先搜、再读、
+   再读。编号承载的是顺序，是信息。
+
+   颜色也是信息：钴蓝实线 = 在仓库里找的；灰色虚线 = 仓库外查的
+   （系统提示词本来就要求模型说明哪些信息来自仓库外，这里把它可视化）。 */
+.prov {
+  counter-reset: prov;
+  display: flex; flex-direction: column;
+  margin-bottom: 12px;
+}
+.prov .tool {
+  counter-increment: prov;
+  display: grid;
+  grid-template-columns: 1.6em minmax(0, auto) minmax(0, 1fr);
+  gap: 10px;
+  align-items: baseline;
+  padding: 3px 0 3px 10px;
+  border-left: 2px solid var(--pen);
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: normal;
+}
+.prov .tool::before {
+  content: counter(prov);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-soft);
+  text-align: right;
+}
+.prov .tool-web { border-left-color: var(--ink-soft); border-left-style: dashed; }
+.tool-name { color: var(--ink-soft); }
+.tool-arg {
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+/* 等待指示：动作（发出去）的回应，不是自娱自乐的入场动画 */
+.msg.pending { color: var(--ink-soft); animation: breathe 1.6s ease-in-out infinite; }
+@keyframes breathe { 0%, 100% { opacity: 0.35; } 50% { opacity: 0.8; } }
+
+/* ── 输入区 ───────────────────────────────────────────────────────────
+   控件统一 3px 圆角（工具感），与 10px 的纸张形成层级，而不是"到处同款圆角" */
+form { flex: 0 0 auto; display: flex; gap: 8px; }
+form input {
+  flex: 1; min-width: 0; font: inherit; padding: 11px 13px;
+  border: 1px solid var(--rule); border-radius: var(--radius-ctl);
+  background: var(--sheet); color: var(--ink);
+}
+button {
+  font: inherit; font-weight: 600; padding: 11px 20px; border: 0;
+  border-radius: var(--radius-ctl);
+  background: var(--pen-fill); color: var(--on-pen); cursor: pointer;
+}
+button:disabled { opacity: 0.5; cursor: progress; }
+
+/* 键盘可达性：只在键盘聚焦时显形，鼠标点击不会留一圈框 */
+:focus-visible { outline: 2px solid var(--pen); outline-offset: 2px; }
+form input:focus-visible,
+.ws-row input:focus-visible,
+.meta input:focus-visible { outline-offset: -1px; }
+
+.ghost {
+  margin-left: auto;
+  font-weight: 500; font-size: 12px; padding: 4px 11px;
+  background: transparent; color: var(--ink-soft);
+  border: 1px solid var(--rule);
+}
+.ghost:hover { color: var(--ink); border-color: var(--ink-soft); }
+
+/* ── 沙箱预览（保留：旧人格的 HTML 产物指令已移除，这条路径不再被引导触发）── */
+.preview-wrap { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+.run {
+  align-self: flex-start;
+  font-weight: 600; font-size: 13px; padding: 6px 14px;
+  background: var(--pen-fill); color: var(--on-pen);
+}
+.preview {
+  width: 100%; height: 340px;
+  border: 1px solid var(--rule); border-radius: var(--radius-ctl);
+  background: #fff;
+}
+.note { font-size: 11.5px; color: var(--ink-soft); white-space: normal; }
+
+/* ── 仓库面板 ──────────────────────────────────────────────────────── */
+.ws {
+  flex: 0 0 auto;
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--rule); border-radius: var(--radius-sheet);
+  background: var(--sheet);
+}
+/* 按**可用宽度**换行，不靠断点。
+   给仓库框 220px 的 flex-basis：放得下就并排，放不下它自己占满一行、
+   分支框和按钮落到第二行。算的是实际可用宽度，所以 320→760 之间连续过渡，
+   不会在某个断点两侧突然跳一下。220px 不随意：约等于能看清一段 owner/repo。 */
+.ws-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.ws-row input {
+  flex: 1 1 220px; min-width: 0;
+  font: inherit; font-size: 13px; padding: 7px 10px;
+  border: 1px solid var(--rule); border-radius: var(--radius-ctl);
+  background: var(--paper); color: var(--ink);
+}
+.ws-row .ws-ref { flex: 0 1 110px; font-family: var(--mono); font-size: 12px; }
+.ws-row button { flex: 0 0 auto; padding: 7px 16px; font-size: 13px; }
+
+.ws-status {
+  display: flex; gap: 12px; flex-wrap: wrap; align-items: baseline;
+  font-size: 12.5px;
+  /* ⚠️ 状态行里会出现不可断的长串（长仓库名、长路径），撑破容器就会让整页横向可拖 */
+  overflow-wrap: anywhere;
+}
+.ws-status > * { min-width: 0; }
+.ws-dim { color: var(--ink-soft); }
+.ws-path {
+  flex-basis: 100%;
+  min-width: 0;
+  font-family: var(--mono); font-size: 11.5px;
+  /* ⚠️ 这里曾经是 `white-space: nowrap` + 省略号，本意单行截断。
+     但导入进度里的路径动辄四五十字符，窄屏下被撑到 589px（视口才 344px），
+     **整个页面因此可以横向拖动**。
+     nowrap 放在 flex 子项上，等于给容器设了一个"不可收缩"的下限。 */
+  overflow-wrap: anywhere;
+}
+.ws-warn { color: var(--warn); font-weight: 600; }
+.ws-error {
+  font-size: 12.5px; color: var(--danger);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  border-left: 2px solid var(--danger); padding-left: 8px;
+}
+
+/* ── 窄屏 ────────────────────────────────────────────────────────────
+   注意这里**只做两件事**：把输入框字号顶到 16px、把留白收紧。
+   换行、滚动、贴底这些都不在这里做——骨架已经保证了，再用断点补一遍
+   就会出现"断点两侧突然跳一下"。 */
+
+/* iOS Safari 在聚焦 font-size < 16px 的输入框时会自动放大整页且不缩回去。
+   顶到 16px 是这条最省事的解法（比 maximum-scale=1 好，那个会连带禁掉双指缩放）。 */
+@media (max-width: 640px) {
+  body { padding: 10px; padding-bottom: calc(10px + env(safe-area-inset-bottom)); }
+  .app { gap: 8px; }
+  .log { padding: 14px; gap: 14px; }
+  .msg.user { max-width: 90%; }
+  h1 { font-size: 16.5px; }
+  .sub { font-size: 12px; }
+  .meta input,
+  .ws-row input,
+  form input { font-size: 16px; }
+  .ws-row input { padding: 9px 11px; }
+  .ws-row button { padding: 10px 18px; }
+  .ws-row .ws-ref { font-size: 15px; }
+  .ghost { padding: 8px 13px; font-size: 13px; }
+  .preview { height: 55dvh; }
+}
+/* ── 矮屏（横屏手机、被压扁的窗口）──────────────────────────────────
+   这里的断点轴是**高度**不是宽度，两者治的是不同的病：
+   宽度决定"怎么换行"，高度决定"还剩多少给正文"。
+   app shell 的前提是"高度够 chrome + 正文 + 发送框"，横屏时这个前提没了 ——
+   顶栏 + 两行 chrome + 仓库面板能吃掉三百多像素，对话区被挤成一条缝。
+   这时退回整页滚动，并给对话区一个高度下限：发送框要滚一下才够得到，
+   但至少读得见内容。（发送框被挤出屏幕正是当初要修的病，所以下限不能没有。） */
+@media (max-height: 520px) {
+  #root { overflow-y: auto; align-items: flex-start; }
+  .log { flex: 0 0 auto; height: 58dvh; min-height: 180px; }
+}
+
+/* 触摸目标别小于 ~44px（独立成块，因为它和屏宽无关，和指针类型有关） */
+@media (pointer: coarse) {
+  button { min-height: 42px; }
+  .ghost { min-height: 34px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

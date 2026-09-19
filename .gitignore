@@ -1,0 +1,15 @@
+# 依赖与构建产物
+node_modules/
+dist/
+
+# ⚠️ 本地密钥：PAGE_PASSWORD 和飞书凭证。绝不入库
+.dev.vars
+.dev.vars.*
+
+# ⚠️ wrangler 的本地状态，含 Durable Object 的 SQLite ——
+# 也就是**真实的对话历史与导入的仓库内容**，不是缓存
+.wrangler/
+
+# 杂项
+.DS_Store
+*.log
