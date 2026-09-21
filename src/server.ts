@@ -20,7 +20,8 @@ import {
 } from "./auth.ts";
 import { WorkspaceRepo } from "./workspace/repo.ts";
 import { makeWorkspaceTools } from "./workspace/tools.ts";
-import { makeSandboxTools } from "./sandbox/tool.ts";
+import { makeSandboxTools, sandboxConfig } from "./sandbox/tool.ts";
+import { WarmSandbox, type SandboxStore, type StoredSandbox } from "./sandbox/warm.ts";
 import { handleWorkspaceRoutes } from "./workspace/routes.ts";
 import { serveIngest } from "./workspace/serve-ingest.ts";
 import { resolveDefaultBranch } from "./workspace/github.ts";
@@ -51,6 +52,26 @@ interface Env {
   // ── 代码沙箱（run_python）。全可选，默认开启 ──────────────────
   /** 设成 0 / false / off 即关闭 run_python。不设 = 开启 */
   SANDBOX_ENABLED?: string;
+  // ── 阿里云 FC 云沙箱（首选）。配了 KEY 就走它 ────────────────
+  /**
+   * 阿里云「云沙箱」的 API Key，在 FC 控制台 → 云沙箱 → API Keys 创建。
+   * 配了它就走这条：有出网、能 pip install、且沙箱跨调用复用。
+   */
+  ALIYUN_SANDBOX_API_KEY?: string;
+  /** 默认 cn-hangzhou。**必须与模板同地域**，否则创建会失败 */
+  ALIYUN_SANDBOX_API_BASE?: string;
+  /** 默认 code-interpreter-v1（预装 python 3.13 / numpy / pandas） */
+  ALIYUN_SANDBOX_TEMPLATE?: string;
+  /** 沙箱存活秒数，默认 900。它是「装一次包一直能用」的时长上限 */
+  ALIYUN_SANDBOX_TTL_SEC?: string;
+  /**
+   * 自建执行器（`executor/`）的地址与共享密钥。**两个都配齐**才走它；
+   * 否则退回 Judge0 公共实例（那个装不了包、也不许出网）。
+   */
+  EXECUTOR_URL?: string;
+  EXECUTOR_KEY?: string;
+  /** 只为工具描述用，应与 `executor/requirements.txt` 保持一致 */
+  EXECUTOR_PACKAGES?: string;
   /** 换成自建 Judge0。默认 https://ce.judge0.com */
   SANDBOX_URL?: string;
   /** 默认 113（Python 3.14）。换实例后语言 id 可能不同，用这个覆盖 */
@@ -80,7 +101,11 @@ type ChatState = {
 // 两个必守点：① 这是 OpenAI 兼容路径，认证头必须是 Authorization: Bearer，
 // 只发 x-api-key 会得到 401 Missing API key（看着像模型不可用，实为头配错）；
 // ② x-opencode-session 必须带，值随便取（只是个路由标签），缺了直接被拒。
-const MODEL = "mimo-v2.5";
+// 2026-09-21 从 mimo-v2.5 换成 deepseek-v4.1-flash。
+// 换之前验过它满足流式输出思考所需的两个条件：返回 `reasoning_content`
+// （流式分片里也带），且工具调用正常（`finish_reason: tool_calls`）。
+// 注：两个模型都具备这两点；换它是因为要按用户指定的模型跑。
+const MODEL = "deepseek-v4.1-flash";
 
 const opencode = (env: Env) =>
   createOpenAICompatible({
@@ -284,6 +309,35 @@ function messageText(m: {
     .join("");
 }
 
+/**
+ * 把工具结果压成**一行**。
+ *
+ * 卡片是给人在手机上看的，工具的完整返回值动辄几千字 —— 全倒进去会把真正的
+ * 回答淹掉，而且飞书卡片本来就不适合读长文本。所以每类结果只挑最值得看的那一个字段。
+ */
+function summarizeToolOutput(output: unknown): string {
+  if (output && typeof output === "object") {
+    const o = output as Record<string, unknown>;
+    if (typeof o.error === "string") return `失败：${o.error.slice(0, 80)}`;
+    // 工具失败**不一定**有 `error` 字段：run_python / install_python_package
+    // 失败时返回的是 `{ok:false, status, stderr}`。只看 error 会把它们判成成功，
+    // 卡片上就会出现一个骗人的 ✅。
+    if (o.ok === false) {
+      const why = String(o.status ?? "").trim();
+      const err = typeof o.stderr === "string" ? o.stderr.trim().split("\n").pop() ?? "" : "";
+      return `失败：${(why || err || "见详情").slice(0, 80)}`;
+    }
+    if (typeof o.stdout === "string" && o.stdout.trim()) {
+      return o.stdout.trim().split("\n")[0].slice(0, 100);
+    }
+    if (typeof o.matchCount === "number") return `命中 ${o.matchCount} 条`;
+    if (Array.isArray(o.paths)) return `${o.paths.length} 个路径`;
+    if (Array.isArray(o.entries)) return `${o.entries.length} 个条目`;
+    if (typeof o.totalLines === "number") return `共 ${o.totalLines} 行`;
+  }
+  return "完成";
+}
+
 export class ChatAgent extends AIChatAgent<Env, ChatState> {
   // 只持有 sql 句柄，每请求复用，不必反复 new
   repo: WorkspaceRepo;
@@ -300,6 +354,14 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
    */
   private feishuStream: FeishuStreamer | null = null;
 
+  /**
+   * 保温沙箱。配了 `ALIYUN_SANDBOX_API_KEY` 才有，否则为 null（退回 Judge0）。
+   *
+   * 句柄存在 DO 的 storage 里而不是内存里：DO 被驱逐后沙箱**还活着**，
+   * 句柄只放内存的话就成了没人回收的孤儿。
+   */
+  private readonly sandbox: WarmSandbox | null;
+
   constructor(ctx: AgentContext, env: Env) {
     super(ctx, env);
     this.envRef = env;
@@ -310,6 +372,19 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
 
     this.feishu = new FeishuStore(this.ctx.storage.sql);
     this.feishu.ensureSchema();
+
+    const scfg = sandboxConfig(env);
+    const storage = this.ctx.storage;
+    const store: SandboxStore = {
+      get: async () => (await storage.get<StoredSandbox>("sandbox")) ?? null,
+      set: async (v) => {
+        if (v) await storage.put("sandbox", v);
+        else await storage.delete("sandbox");
+      },
+    };
+    this.sandbox = scfg.aliyun
+      ? new WarmSandbox(scfg.aliyun, store, scfg.ttlSec)
+      : null;
 
     this.sessions
       .session()
@@ -570,7 +645,7 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
       const p = (payload ?? {}) as { tool?: string; args?: unknown };
       const tools = {
         ...makeWorkspaceTools(this.repo),
-        ...makeSandboxTools(this.repo, this.envRef),
+        ...makeSandboxTools(this.repo, this.envRef, this.sandbox),
       } as unknown as Record<string, { execute?: (a: unknown) => unknown }>;
       const t = tools[String(p.tool ?? "")];
       if (!t || typeof t.execute !== "function") {
@@ -789,7 +864,7 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
       tools: {
         ...makeTools(this.env),
         ...makeWorkspaceTools(this.repo),
-        ...makeSandboxTools(this.repo, this.envRef),
+        ...makeSandboxTools(this.repo, this.envRef, this.sandbox),
       },
       // 允许"ls → read → grep → 答"这种多步；不设就是一步，工具调完就停
       stopWhen: stepCountIs(MAX_STEPS),
@@ -797,12 +872,40 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
       // 不加这个，循环会停在"刚调完工具"那一拍，最终 text 为空 —— 页面上就是工具全跑完了却永远没有回答。
       prepareStep: ({ stepNumber }) =>
         stepNumber >= MAX_STEPS - 1 ? { activeTools: [] } : undefined,
-      // 飞书流式：把增量接出去。网页那条路 `feishuStream` 是 null，这里是空转。
+      // 飞书流式：把**思考、工具调用、答案**按到达顺序接进同一张卡片。
+      // 网页那条路 `feishuStream` 是 null，这里是空转。
       //
       // ⚠️ 回调**必须同步返回** —— SDK 会暂停整个流直到这个 promise 完成。
       // 所以这里只往内存里追加，出网由 FeishuStreamer 自己的定时器负责。
+      //
+      // 为什么合成一条流而不是分几块：飞书卡片只能**追加**（新文本不是旧文本
+      // 前缀时，平台会整段重上屏、打字机效果断掉）。既然只能追加，
+      // 那就按模型真实的产出顺序排成一串 —— 这也正好是读起来最自然的顺序。
       onChunk: ({ chunk }) => {
-        if (chunk.type === "text-delta") this.feishuStream?.push(chunk.text);
+        const s = this.feishuStream;
+        if (!s) return;
+        switch (chunk.type) {
+          case "reasoning-delta":
+            s.pushReasoning(chunk.text);
+            break;
+          case "text-delta":
+            s.push(chunk.text);
+            break;
+          case "tool-input-start":
+            s.pushToolCall(chunk.toolName);
+            break;
+          case "tool-result": {
+            const out = (chunk as { output?: unknown }).output;
+            const failed =
+              !!out &&
+              typeof out === "object" &&
+              ("error" in out || (out as { ok?: unknown }).ok === false);
+            s.pushToolResult(!failed, summarizeToolOutput(out));
+            break;
+          }
+          default:
+            break;
+        }
       },
     });
 

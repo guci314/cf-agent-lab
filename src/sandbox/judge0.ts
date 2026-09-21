@@ -10,10 +10,8 @@
 // 变成一堆难查的乱码。base64 多一点体积，换掉整类问题，值。
 
 import { base64ToText, textToBase64, toBase64 } from "./base64.ts";
-import { zipStore, type ZipEntry } from "./zip.ts";
-
-/** Judge0 的 "Accepted" —— 脚本跑完了（哪怕是非零退出，那也是 status 11） */
-const ACCEPTED = 3;
+import { zipStore } from "./zip.ts";
+import { STATUS_ACCEPTED, type RunRequest, type RunResult } from "./types.ts";
 
 /** 只翻常用的几个，其余透传 Judge0 自己的英文描述 */
 const STATUS_ZH: Record<number, string> = {
@@ -44,41 +42,18 @@ export interface Judge0Config {
   apiKey?: string;
 }
 
-export interface Judge0Request {
-  code: string;
-  stdin?: string;
-  /** 会以原名出现在沙箱的工作目录里 */
-  files?: ZipEntry[];
-  cpuTimeLimit: number;
-  wallTimeLimit: number;
-  memoryLimitKb: number;
-  /** 本地这一侧的等待上限，要**大于** wallTimeLimit + 排队时间 */
-  timeoutMs: number;
-}
-
-export interface Judge0Result {
-  /** 脚本是否正常跑完（不看退出码） */
-  ok: boolean;
-  statusId: number;
-  status: string;
-  /** Judge0 的 message，非零退出码就藏在这里（如 "Exited with error status 3"） */
-  message: string | null;
-  stdout: string;
-  stderr: string;
-  timeSec: string | null;
-  memoryKb: number | null;
-}
+// 请求/结果的形状与另一个后端共用，见 types.ts。
 
 function b64Field(v: unknown): string {
   if (typeof v !== "string" || v === "") return "";
   return base64ToText(v);
 }
 
-function normalize(raw: Record<string, unknown>): Judge0Result {
+function normalize(raw: Record<string, unknown>): RunResult {
   const st = (raw.status ?? {}) as { id?: unknown; description?: unknown };
   const id = typeof st.id === "number" ? st.id : 0;
   return {
-    ok: id === ACCEPTED,
+    ok: id === STATUS_ACCEPTED,
     statusId: id,
     status:
       STATUS_ZH[id] ??
@@ -93,8 +68,8 @@ function normalize(raw: Record<string, unknown>): Judge0Result {
 
 export async function judge0Run(
   cfg: Judge0Config,
-  req: Judge0Request,
-): Promise<Judge0Result> {
+  req: RunRequest,
+): Promise<RunResult> {
   const payload: Record<string, unknown> = {
     language_id: cfg.languageId,
     source_code: textToBase64(req.code),

@@ -27,6 +27,11 @@ export class FeishuStreamer {
   private sequence = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
   private busy = false;
+  // 分段标记。卡片只能**追加**（前缀一变平台就整段重上屏，打字机效果就没了），
+  // 所以思考 / 工具 / 答案只能按到达顺序排成一串，靠这几个标记插一次头
+  private reasoningOpen = false;
+  private sawReasoning = false;
+  private answerOpen = false;
 
   constructor(
     private env: FeishuEnv,
@@ -53,9 +58,48 @@ export class FeishuStreamer {
     }
   }
 
-  /** 追加增量。**必须同步** —— 见文件头 */
+  /** 追加答案正文的增量。**必须同步** —— 见文件头 */
   push(delta: string): void {
+    this.reasoningOpen = false;
+    if (!this.answerOpen) {
+      // 前面已经有思考或工具时才插分隔线；一上来就答的那种不用
+      if (this.buffer) this.buffer += "\n\n---\n\n";
+      this.answerOpen = true;
+    }
     this.buffer += delta;
+  }
+
+  /**
+   * 思考增量。
+   *
+   * ⚠️ 多步循环里模型会**想好几轮**（想 → 调工具 → 再想 → 再调）。每一轮都要
+   * 重新起段，否则第二轮的思考会直接粘在上一段末尾 —— 实测会得到
+   * `✅ median 4.0Report results, …` 这种连成一坨的排版。
+   */
+  pushReasoning(delta: string): void {
+    if (!this.reasoningOpen) {
+      this.buffer += this.sawReasoning
+        ? "\n\n🤔 "
+        : "🤔 **思考中…**\n\n";
+      this.sawReasoning = true;
+      this.reasoningOpen = true;
+    }
+    this.buffer += delta;
+  }
+
+  /** 工具调用。只记名字 —— 参数和结果对读卡片的人没用，还会把正文挤没 */
+  pushToolCall(name: string): void {
+    this.reasoningOpen = false;
+    this.buffer += `\n\n🔧 \`${name}\``;
+  }
+
+  /**
+   * 工具结果。**只给一行结论**：完整结果往往几千字，
+   * 倒进卡片会把真正的回答淹掉，而且飞书卡片本来就不适合读长文本。
+   */
+  pushToolResult(ok: boolean, summary: string): void {
+    this.reasoningOpen = false;
+    this.buffer += `\n${ok ? "✅" : "❌"} ${summary}`;
   }
 
   /** 出错时把说明直接写进卡片，用户看到的是「回答的位置上写着为什么没答上来」 */

@@ -6,7 +6,10 @@
 import { jsonSchema, tool } from "ai";
 import type { WorkspaceRepo } from "../workspace/repo.ts";
 import { guarded } from "../workspace/tools.ts";
-import { judge0Run, type Judge0Result } from "./judge0.ts";
+import { judge0Run } from "./judge0.ts";
+import { executorRun } from "./executor.ts";
+import type { WarmSandbox } from "./warm.ts";
+import type { RunResult } from "./types.ts";
 
 const DEFAULT_BASE_URL = "https://ce.judge0.com";
 /** Python 3.14.0（Judge0 CE 的标准语言表）。换实例时用 SANDBOX_LANGUAGE_ID 覆盖 */
@@ -27,20 +30,61 @@ const WALL_TIME_LIMIT = 10;
 const MEMORY_LIMIT_KB = 256_000;
 /** 本地等待上限：必须**大于** wallTimeLimit + 排队，否则会把自己的超时误报成沙箱故障 */
 const REQUEST_TIMEOUT_MS = 25_000;
+// 阿里云沙箱这条路的等待上限。给得比 Judge0 宽：沙箱是保温的、没有排队，
+// 但跑飞的脚本仍要有个头（超时只是我们不再等；沙箱里的进程会随沙箱一起到期）。
+const SCRIPT_TIMEOUT_MS = 30_000;
+// 装包的等待上限。实测 pip install openai-agents 要 24s，留足余量
+const INSTALL_TIMEOUT_MS = 180_000;
+const INSTALL_MAX_PACKAGES = 8;
 
 export interface SandboxEnv {
   /** 设成 0/false/off 即整条关闭。其它值（含未设）= 开启 */
   SANDBOX_ENABLED?: string;
+  /** 配了（且配了 KEY）就走自建执行器；否则退回 Judge0 公共实例 */
+  EXECUTOR_URL?: string;
+  EXECUTOR_KEY?: string;
+  /** 只为工具描述用：告诉模型执行器里烤了什么。应与 executor/requirements.txt 一致 */
+  EXECUTOR_PACKAGES?: string;
   SANDBOX_URL?: string;
   SANDBOX_LANGUAGE_ID?: string;
   SANDBOX_API_KEY?: string;
+  // ── 阿里云 FC 云沙箱。配了 KEY 就走它（功能最全：有网、能 pip、跨调用复用）──
+  ALIYUN_SANDBOX_API_KEY?: string;
+  /** 默认 cn-hangzhou。必须与模板同地域，否则创建会失败 */
+  ALIYUN_SANDBOX_API_BASE?: string;
+  /** 默认 code-interpreter-v1 */
+  ALIYUN_SANDBOX_TEMPLATE?: string;
+  /** 沙箱存活秒数，默认 900。越大复用越久，但也越久才回收 */
+  ALIYUN_SANDBOX_TTL_SEC?: string;
 }
+
+const DEFAULT_EXECUTOR_PACKAGES = "numpy / pandas / openai-agents";
+const DEFAULT_ALIYUN_API_BASE = "https://api.cn-hangzhou.e2b.fc.aliyuncs.com";
+const DEFAULT_ALIYUN_TEMPLATE = "code-interpreter-v1";
+const DEFAULT_ALIYUN_TTL_SEC = 900;
 
 export function sandboxConfig(env: SandboxEnv) {
   const off = (env.SANDBOX_ENABLED ?? "").trim().toLowerCase();
   const id = Number(env.SANDBOX_LANGUAGE_ID ?? "");
+  const executorUrl = (env.EXECUTOR_URL ?? "").trim();
+  const executorKey = (env.EXECUTOR_KEY ?? "").trim();
+  const aliyunKey = (env.ALIYUN_SANDBOX_API_KEY ?? "").trim();
+  const ttl = Number(env.ALIYUN_SANDBOX_TTL_SEC ?? "");
   return {
     enabled: off !== "0" && off !== "false" && off !== "off",
+    // URL 和 KEY 都配齐才算数。只配了 URL 的话请求会被 401 掉，
+    // 与其让模型白跑一趟再报错，不如当没配、老实退回 Judge0。
+    executor:
+      executorUrl && executorKey ? { url: executorUrl, key: executorKey } : null,
+    aliyun: aliyunKey
+      ? {
+          apiKey: aliyunKey,
+          apiBase: (env.ALIYUN_SANDBOX_API_BASE ?? "").trim() || DEFAULT_ALIYUN_API_BASE,
+          template: (env.ALIYUN_SANDBOX_TEMPLATE ?? "").trim() || DEFAULT_ALIYUN_TEMPLATE,
+        }
+      : null,
+    ttlSec: Number.isFinite(ttl) && ttl > 0 ? Math.trunc(ttl) : DEFAULT_ALIYUN_TTL_SEC,
+    packages: (env.EXECUTOR_PACKAGES ?? "").trim() || DEFAULT_EXECUTOR_PACKAGES,
     baseUrl: (env.SANDBOX_URL ?? "").trim() || DEFAULT_BASE_URL,
     languageId: Number.isFinite(id) && id > 0 ? Math.trunc(id) : DEFAULT_LANGUAGE_ID,
     apiKey: (env.SANDBOX_API_KEY ?? "").trim() || undefined,
@@ -63,18 +107,29 @@ function clipUtf8(s: string, maxBytes: number): { text: string; truncated: boole
  * 没有这段，模型看到 ModuleNotFoundError 的第一反应是换个包名再试一次 ——
  * 而真正的原因是镜像里根本没有第三方包，再试多少次都一样。
  */
-function hintFor(r: Judge0Result): string | undefined {
+function hintFor(r: RunResult, cfg: ReturnType<typeof sandboxConfig>): string | undefined {
   const all = `${r.stderr}\n${r.message ?? ""}`;
+  // 提示必须**跟着后端变**：同一个 ModuleNotFoundError，在 Judge0 上是
+  // "这里没有第三方包"（换代码写），在阿里云沙箱上是"装一下就有"（换工具）。
+  // 给错方向的提示比不给提示更糟 —— 模型会照着错的结论改代码，越改越远。
+  const canInstall = cfg.aliyun !== null;
+  const hasNetwork = cfg.aliyun !== null || cfg.executor !== null;
+
   if (/ModuleNotFoundError|ImportError/.test(all)) {
-    return "沙箱里只有 Python 标准库，装不了也没法装第三方包。改用 csv / json / re / sqlite3 / statistics / collections / itertools / math 这些重写。";
+    return canInstall
+      ? "缺第三方包。这个沙箱可以装包：用 install_python_package 装好再跑，不要改用标准库硬凑。" +
+          "（也别指望在 run_python 里 pip —— 它的墙钟装不完一个包。）"
+      : "沙箱里只有 Python 标准库，装不了也没法装第三方包。改用 csv / json / re / sqlite3 / statistics / collections / itertools / math 这些重写。";
   }
   if (r.statusId === 5) {
-    return "脚本超时（10 秒墙钟 / 5 秒 CPU）。缩小输入规模、去掉不必要的循环，或先用小样本验证逻辑。";
+    return canInstall
+      ? "脚本超时。缩小输入规模、去掉不必要的循环，或先用小样本验证逻辑。"
+      : "脚本超时（10 秒墙钟 / 5 秒 CPU）。缩小输入规模、去掉不必要的循环，或先用小样本验证逻辑。";
   }
-  // 网络报错至少两种长相：走 urllib 是 URLError + "name resolution"，
-  // 直接开 socket 则是裸 OSError("Network is unreachable")。两种都得认，
-  // 只match前者的话，模型改开 socket 再来一次就会发现提示消失了。
+  // 只在真的没网时才提这句。有网的后端上，连不上往往是目标站点的问题，
+  // 谎报"沙箱没网"会让模型绕远路。
   if (
+    !hasNetwork &&
     /URLError|ConnectionError|getaddrinfo|name resolution|Connection refused|Network is unreachable|No route to host|Errno 10[13]|Errno 111/.test(
       all,
     )
@@ -87,23 +142,58 @@ function hintFor(r: Judge0Result): string | undefined {
   return undefined;
 }
 
-export function makeSandboxTools(repo: WorkspaceRepo, env: SandboxEnv) {
+// 描述随后端变。这不是文案问题 —— 这是**让模型少跑冤枉路**的地方：
+// Judge0 那版把"只有标准库"写死，模型就不会去 import pandas；
+// 换成执行器后若还留着这句，模型会白白绕开已经装好的包。
+function describeBackend(cfg: ReturnType<typeof sandboxConfig>): string {
+  if (cfg.aliyun) {
+    return (
+      "① **有状态** —— 沙箱跨调用复用：你装过的包、写下的文件都留在同一个沙箱里，" +
+      "下次调用还能看到（沙箱到期后才会重置）。所以反复要用的库**装一次就够**，" +
+      "别每次都装；也不要假设环境是干净的。\n" +
+      "② 每个脚本仍是**新进程** —— 文件和已装的包会留下，但上次定义的变量不会。" +
+      "需要多步就写成一个脚本一次跑完。\n" +
+      "③ 有网络，**而且能装包**：要装库用 `install_python_package` 工具，" +
+      "不要写在 run_python 的代码里 —— run_python 的墙钟（" + WALL_TIME_LIMIT +
+      " 秒）装不完一个包。模板已预装 numpy / pandas。\n"
+    );
+  }
+  if (cfg.executor) {
+    return (
+      "① 无状态 —— 每次调用都是全新进程，上一次定义的变量、导入的模块、写下的文件全都不在。" +
+      "需要多步就写成一个脚本一次跑完（在同一次调用里依次做）。\n" +
+      "② 依赖是固定的 —— 预装了 " + cfg.packages + "，**装不了额外的包**（沙箱里没有 pip）。\n" +
+      "③ 有网络 —— 可以直接出网。\n"
+    );
+  }
+  return (
+    "① 无状态 —— 每次调用都是全新进程，上一次定义的变量、导入的模块、写下的文件全都不在。" +
+    "需要多步就写成一个脚本一次跑完（在同一次调用里依次做）。\n" +
+    "② 只有标准库 —— 没有任何第三方包，import numpy / pandas / requests 一律 ModuleNotFoundError。" +
+    "能用的是 csv / json / re / sqlite3 / statistics / collections / itertools / math / datetime 这些。\n" +
+    "③ 无网络 —— 出网请求全部失败。要外部资料用 fetch_page / web_search。\n"
+  );
+}
+
+export function makeSandboxTools(
+  repo: WorkspaceRepo,
+  env: SandboxEnv,
+  /** 配了阿里云沙箱时由 ChatAgent 注入；没有则退回 Judge0 / 执行器 */
+  warm: WarmSandbox | null,
+) {
   const cfg = sandboxConfig(env);
+  const description =
+    "在沙箱里执行一段 Python 脚本，返回 stdout / stderr。用来验算、复现一段逻辑，" +
+    "不是用来跑用户项目的测试套件。\n" +
+    "⚠️ 先看下面几条约束，不知道就会白跑一轮：\n" +
+    describeBackend(cfg) +
+    "files 里列出的仓库文件会以原名出现在工作目录，用 open() / csv.reader 按相对路径读。" +
+    `超时 ${WALL_TIME_LIMIT} 秒；stdout/stderr 各自超过 ${OUT_MAX_BYTES} 字节会被截断，截断处有说明。\n` +
+    "脚本失败不会报错，而是返回 ok=false 加 status / stderr / message，据此判断。";
 
   return {
     run_python: tool({
-      description:
-        "在一次性沙箱里执行一段 Python 3.14 脚本，返回 stdout / stderr。用来验算或复现一段逻辑，" +
-        "不是用来跑用户项目的测试套件。\n" +
-        "⚠️ 三条硬约束，不知道就会白跑一轮：\n" +
-        "① 无状态 —— 每次调用都是全新进程，上一次定义的变量、导入的模块、写下的文件全都不在。" +
-        "需要多步就写成一个脚本一次跑完（在同一次调用里依次做）。\n" +
-        "② 只有标准库 —— 没有任何第三方包，import numpy / pandas / requests 一律 ModuleNotFoundError。" +
-        "能用的是 csv / json / re / sqlite3 / statistics / collections / itertools / math / datetime 这些。\n" +
-        "③ 无网络 —— 出网请求全部失败。要外部资料用 fetch_page / web_search。\n" +
-        "files 里列出的仓库文件会以原名出现在工作目录，用 open() / csv.reader 按相对路径读。" +
-        "超时 10 秒（CPU 5 秒）；stdout/stderr 各自超过 16KB 会被截断，截断处有说明。\n" +
-        "脚本失败不会报错，而是返回 ok=false 加 status / stderr / message，据此判断。",
+      description,
       inputSchema: jsonSchema<{
         code: string;
         stdin?: string;
@@ -189,22 +279,32 @@ export function makeSandboxTools(repo: WorkspaceRepo, env: SandboxEnv) {
             }
           }
 
-          const r = await judge0Run(
-            { baseUrl: cfg.baseUrl, languageId: cfg.languageId, apiKey: cfg.apiKey },
-            {
-              code: src,
-              stdin: inText || undefined,
-              files: staged.length > 0 ? staged : undefined,
-              cpuTimeLimit: CPU_TIME_LIMIT,
-              wallTimeLimit: WALL_TIME_LIMIT,
-              memoryLimitKb: MEMORY_LIMIT_KB,
-              timeoutMs: REQUEST_TIMEOUT_MS,
-            },
-          );
+          const request = {
+            code: src,
+            stdin: inText || undefined,
+            files: staged.length > 0 ? staged : undefined,
+            cpuTimeLimit: CPU_TIME_LIMIT,
+            wallTimeLimit: WALL_TIME_LIMIT,
+            memoryLimitKb: MEMORY_LIMIT_KB,
+            timeoutMs: REQUEST_TIMEOUT_MS,
+          };
+          const r = warm
+            ? await warm.run({
+                code: src,
+                stdin: inText || undefined,
+                files: staged.length > 0 ? staged : undefined,
+                timeoutMs: SCRIPT_TIMEOUT_MS,
+              })
+            : cfg.executor
+              ? await executorRun(cfg.executor, request)
+              : await judge0Run(
+                  { baseUrl: cfg.baseUrl, languageId: cfg.languageId, apiKey: cfg.apiKey },
+                  request,
+                );
 
           const out = clipUtf8(r.stdout, OUT_MAX_BYTES);
           const err = clipUtf8(r.stderr, OUT_MAX_BYTES);
-          const hint = hintFor(r);
+          const hint = hintFor(r, cfg);
           // 标记写在**正文里**，不能只靠 truncated 字段：模型读的是字符串，
           // 不会去翻兄弟字段，半截输出会被当成完整结果下结论。
           const outText = out.truncated
@@ -230,5 +330,58 @@ export function makeSandboxTools(repo: WorkspaceRepo, env: SandboxEnv) {
           };
         }),
     }),
+
+    // 只在**能装包**的后端上挂出这个工具。没有它的时候不要挂 ——
+    // 一个永远失败的工具摆在那儿，只会让模型反复去试。
+    ...(warm
+      ? {
+          install_python_package: tool({
+            description:
+              "往当前沙箱里装 Python 包（pip install）。装好后**在同一个沙箱里一直有效**，" +
+              "之后 run_python 可以直接 import，不需要再装。\n" +
+              "⚠️ 这一步慢（一个包通常十几到几十秒）—— 所以**不要**在 run_python 的代码里 pip，" +
+              "它的墙钟装不完；要装就在这里装一次。\n" +
+              "模板已预装 numpy / pandas，别装这两个。只写包名，不要写版本号或 shell 语法。",
+            inputSchema: jsonSchema<{ packages: string[] }>({
+              type: "object",
+              properties: {
+                packages: {
+                  type: "array",
+                  items: { type: "string" },
+                  description: `要安装的包名，如 ["openai-agents"]，最多 ${INSTALL_MAX_PACKAGES} 个`,
+                },
+              },
+              required: ["packages"],
+              additionalProperties: false,
+            }),
+            execute: async ({ packages }) =>
+              guarded(async () => {
+                const list = Array.isArray(packages)
+                  ? packages.map((p) => String(p ?? "").trim()).filter(Boolean)
+                  : [];
+                if (list.length === 0) return { error: "packages 不能为空" };
+                if (list.length > INSTALL_MAX_PACKAGES) {
+                  return { error: `一次最多装 ${INSTALL_MAX_PACKAGES} 个包，收到 ${list.length} 个` };
+                }
+
+                const t0 = Date.now();
+                const r = await warm.install(list, INSTALL_TIMEOUT_MS);
+                const out = clipUtf8(r.stdout, OUT_MAX_BYTES);
+                const err = clipUtf8(r.stderr, OUT_MAX_BYTES);
+
+                return {
+                  ok: r.ok,
+                  packages: list,
+                  ms: Date.now() - t0,
+                  stdout: out.truncated ? `${out.text}\n…[已截断]` : out.text,
+                  stderr: err.truncated ? `${err.text}\n…[已截断]` : err.text,
+                  ...(r.ok
+                    ? { note: "装好了。后续 run_python 可以直接 import，不用再装。" }
+                    : { hint: "装包失败。确认包名拼写是否正确；模板里已经有 numpy / pandas，不用装。" }),
+                };
+              }),
+          }),
+        }
+      : {}),
   };
 }
