@@ -25,6 +25,8 @@ import { WarmSandbox, type SandboxStore, type StoredSandbox } from "./sandbox/wa
 import { handleWorkspaceRoutes } from "./workspace/routes.ts";
 import { serveIngest } from "./workspace/serve-ingest.ts";
 import { resolveDefaultBranch } from "./workspace/github.ts";
+import { makeGithubTools } from "./ghworkspace/tools.ts";
+import { ghWorkspaceConfig, type GhWorkspaceConfig } from "./ghworkspace/client.ts";
 import { handleFeishuRoutes } from "./feishu/router.ts";
 import type { FeishuQueueEvent } from "./feishu/router.ts";
 import { FeishuStore } from "./feishu/store.ts";
@@ -85,6 +87,16 @@ interface Env {
   SANDBOX_LANGUAGE_ID?: string;
   /** 自建实例需要鉴权时用（X-Auth-Token）。公共实例不要设 */
   SANDBOX_API_KEY?: string;
+  // ── GitHub 工作区仓库（都可选：没配 TOKEN 就没有那一族工具）─────────
+  /**
+   * fine-grained PAT，**只授予工作区仓库这一个仓库的 Contents 读写**。
+   * 这是 secret：走 `wrangler secret put`，不进源码也不进 bundle。
+   */
+  GITHUB_WORKSPACE_TOKEN?: string;
+  /** "owner/name"。不是密钥，默认 guci314/cf-agent-workspace */
+  GITHUB_WORKSPACE_REPO?: string;
+  /** 只为本地测试指向 mock。生产不要设 */
+  GITHUB_API_BASE?: string;
 }
 
 type ChatState = {
@@ -137,8 +149,13 @@ const SYSTEM_PROMPT =
   "仓库里确实没有答案时，可以用 web_search / fetch_page 查外部资料，但要说明那是仓库外的信息。" +
   // 沙箱结果和仓库内容必须分开说。不写这条，模型会把「我跑出来是这样」直接
   // 当成「这个仓库就是这样」—— 而沙箱里跑的是它自己写的脚本，不是仓库的代码。
-  "需要验算算法、正则或复现某段逻辑时，可以用 run_python 在沙箱里跑一小段 Python" +
-  "（只有标准库、无网络、每次调用互不相干）。" +
+  "需要验算算法、正则或复现某段逻辑时，可以用 run_python 在沙箱里跑一小段 Python。" +
+  // ⚠️ 这里曾经写死「只有标准库、无网络、每次调用互不相干」—— 那是 Judge0 那代后端的
+  // 事实，换成阿里云沙箱后已经不成立（有网、能 pip、跨调用复用）。同一件事两处说法不一，
+  // 模型会照错的那份走：明明能装 pandas 却用标准库硬凑。沙箱能力**随后端变**，
+  // 所以这里不复述，指向工具描述那份唯一的真相（describeBackend 是按后端生成的）。
+  "沙箱的具体能力（有没有网、能不能装包、是否跨调用保留文件）**随后端不同**，" +
+  "以 run_python 工具描述里列的那几条为准，不要凭印象假设。" +
   "但要把沙箱结果和仓库内容分清楚：那是你自己写的脚本跑出来的，不是仓库里既有的事实，" +
   "引用时要说明「按上述逻辑推演」而不是当成「仓库里写着」。" +
   "回答简洁，不要客套。";
@@ -337,6 +354,13 @@ function summarizeToolOutput(output: unknown): string {
     if (typeof o.stdout === "string" && o.stdout.trim()) {
       return o.stdout.trim().split("\n")[0].slice(0, 100);
     }
+    // 工作区仓库的写/删。两者的 shape 只差一个 deleted 标志，一个分支盖住。
+    // 没有这段它们会掉到最后那个兜底的「完成」，卡片上看不出到底干了什么 ——
+    // 而这一族工具**改了 GitHub 上的东西**，摘要必须说清改了什么。
+    if (typeof o.commit === "string" && typeof o.path === "string") {
+      const op = o.deleted ? "已删除" : o.created ? "已创建" : "已更新";
+      return `${op} ${String(o.path).slice(0, 60)}`;
+    }
     if (typeof o.matchCount === "number") return `命中 ${o.matchCount} 条`;
     if (Array.isArray(o.paths)) return `${o.paths.length} 个路径`;
     if (Array.isArray(o.entries)) return `${o.entries.length} 个条目`;
@@ -369,6 +393,12 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
    */
   private readonly sandbox: WarmSandbox | null;
 
+  /**
+   * GitHub 工作区仓库的配置。**没配 token 就是 null**，那一族 ws_* 工具一个都不挂 ——
+   * 挂出来只会让模型反复试用一个必然失败的工具。
+   */
+  private readonly ghworkspace: GhWorkspaceConfig | null;
+
   constructor(ctx: AgentContext, env: Env) {
     super(ctx, env);
     this.envRef = env;
@@ -392,6 +422,8 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
     this.sandbox = scfg.aliyun
       ? new WarmSandbox(scfg.aliyun, store, scfg.ttlSec)
       : null;
+
+    this.ghworkspace = ghWorkspaceConfig(env);
 
     this.sessions
       .session()
@@ -653,6 +685,10 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
       const tools = {
         ...makeWorkspaceTools(this.repo),
         ...makeSandboxTools(this.repo, this.envRef, this.sandbox),
+        // 工作区仓库那一族也放进来。这不是可选项：本机 `wrangler tail` 抓不到任何
+        // 日志，这个探针是**唯一**能不经模型就跑一个工具的路子 —— 不放进来，
+        // 线上出问题就完全没有观测手段。
+        ...makeGithubTools(this.ghworkspace),
       } as unknown as Record<string, { execute?: (a: unknown) => unknown }>;
       const t = tools[String(p.tool ?? "")];
       if (!t || typeof t.execute !== "function") {
@@ -867,13 +903,29 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
     // 引用代码正是这个产品的主业，平铺反而难读。
     //
     // 唯一保留的约束是**宽表格**：卡片在手机上的宽度很窄，宽表格要横向滚动才看得全。
+    // 工作区仓库那一族工具。**只在真配了凭证时才说** —— 提一个模型手上没有的工具，
+    // 它就会去调，然后拿到「没有这个工具」，白烧一轮。
+    const wsHint = this.ghworkspace
+      ? `\n\n你在 GitHub 上有一个**工作区仓库** \`${this.ghworkspace.repo}\`（私有），` +
+        "用 ws_ls / ws_read / ws_write / ws_rm 读写。" +
+        "⚠️ 它和 `read`/`ls`/`grep`/`find` 是两个**完全不同的仓库**：" +
+        "那四个读的是**用户导入的**代码快照（只读、存在本地、别人的代码）；" +
+        "ws_* 读写的是**你自己的**工作区仓库（可写、在 GitHub 上、每次写都是一次真实 commit，用户看得见）。" +
+        "要读哪个就用哪个的工具，**不要交叉**。" +
+        "值得跨会话保留的产出（结论、笔记、脚本、清单）写进工作区；只在这一次回答里用到的草稿留在正文里，不要为草稿制造 commit。" +
+        "覆盖已有文件前先用 ws_read 看一眼现状，别盖掉别人的改动。" +
+        "⚠️ **绝对不要把密钥、token、密码、cookie、.env 内容写进工作区仓库** —— " +
+        "它是 GitHub 上的仓库，即使私有，一旦提交就永久留在 git 历史里，删不干净。" +
+        "要写配置就用占位符（如 ${OPENCODE_API_KEY}）并在正文里说明那是占位符。"
+      : "";
+
     const system =
       (this.isFeishuChannel
         ? base +
           "\n\n注意：回答会显示在飞书的卡片里，**支持 Markdown** —— 代码块、`行内代码`、列表、加粗都能正常渲染。" +
           "引用代码时用代码块并标出行号，行内提到标识符用反引号，比平铺更好读。" +
           "只有一个要避开：**别用宽表格**（手机上的卡片很窄，宽表格要横向滚动才看得全），需要对比时改用列表。回答尽量短。"
-        : base) + llmHint;
+        : base) + llmHint + wsHint;
 
     const result = streamText({
       model: opencode(this.env)(MODEL),
@@ -885,6 +937,7 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
         ...makeTools(this.env),
         ...makeWorkspaceTools(this.repo),
         ...makeSandboxTools(this.repo, this.envRef, this.sandbox),
+        ...makeGithubTools(this.ghworkspace),
       },
       // 允许"ls → read → grep → 答"这种多步；不设就是一步，工具调完就停
       stopWhen: stepCountIs(MAX_STEPS),
