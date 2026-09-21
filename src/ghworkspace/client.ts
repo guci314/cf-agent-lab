@@ -20,9 +20,18 @@ export const DEFAULT_API_BASE = "https://api.github.com";
 /** 仓库名不是密钥，硬编码默认值；要改指向就用 GITHUB_WORKSPACE_REPO */
 export const DEFAULT_REPO = "guci314/cf-agent-workspace";
 
-const GET_TIMEOUT_MS = 10_000;
-/** 写比读慢（请求体可能几百 KB），给宽一点 */
-const WRITE_TIMEOUT_MS = 15_000;
+// ⚠️ 超时给得比"正常该多快"宽得多，是有意的。
+//
+// 原来的 10s / 15s 是按"GitHub 正常几百毫秒就回"定的，实际太紧：写一个文件不是
+// **一次**请求 —— 得先 GET 拿当前 sha 再 PUT，任何一次慢都让整个写操作失败，
+// 而用户看到的是"写操作超时"。这类失败还会有连锁反应：模型拿到超时后往往重试，
+// 于是一轮对话里反复卡同一个慢请求。
+//
+// 代价是极端情况下单次工具调用最长等这么久。但"等的久"远好过"明明能成却报错"：
+// 前者只是慢，后者会让模型基于假信息改道。
+const GET_TIMEOUT_MS = 25_000;
+/** 写要传请求体（可能几百 KB）而且 GitHub 侧要落一次 commit，比读更慢 */
+const WRITE_TIMEOUT_MS = 30_000;
 
 export interface GhWorkspaceConfig {
   token: string;

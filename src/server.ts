@@ -176,7 +176,24 @@ const MAX_OUTPUT_TOKENS = 8_192;
 // 实测一次"搜 GitHub 有没有 Workers 上的 ERP"要 6 步才收尾。
 // 加了代码工具后提到 16：光是「ls → read → read → 回答」就要 4 步，
 // 12 在真实调研里会卡在边界上（撞上就会以"空答案"的形式静默失败）。
-const MAX_STEPS = 16;
+// 从 16 提到 24：16 那档在"读几个文件 + 写回"这类任务上会撞顶（实测：列目录 →
+// 读文件 → 写文件 → 回读校验 这种四步任务，模型常拆成六七个工具调用）。
+// 撞顶本身不可怕，可怕的是撞顶后拿不到结论 —— 所以下面那条收尾指令是配套的，
+// 两者要一起看：**提高预算让它做得完，收尾指令保证做不完时也说得清。**
+const MAX_STEPS = 24;
+
+/**
+ * 步数用尽的最后一拍，连同"工具已摘掉"一起塞进去的指令。
+ *
+ * 「必须留文字」那句不是客套：这一拍最常见的失败就是模型还在想"再查一下就齐了"，
+ * 手上却没工具了，于是回一个空串 —— 飞书上表现为"跑了一串工具然后没了"。
+ * 点名要它交代"已确认什么、还缺什么"，至少能拿到一个有信息量的收尾。
+ */
+const FINAL_STEP_NUDGE =
+  "（系统提示）本轮的调查预算已经用尽，**不能再调用任何工具了**。" +
+  "请立刻基于已经拿到的信息，用文字给出最终回答。" +
+  "如果信息还不足以完整回答，就说清楚你已经确认了什么、还缺什么、建议下一步怎么做。" +
+  "**必须留下文字回答，不要返回空内容。**";
 
 // 抓页的边界：先按字节截断再解析，避免大页面把免费的 10ms CPU 打爆
 const MAX_FETCH_CHARS = 300_000;
@@ -609,6 +626,20 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
       const last = this.messages[this.messages.length - 1];
       const answer = last?.role === "assistant" ? messageText(last) : "";
 
+      // ⚠️ 跑完了但**一个字都没说** —— 这是最阴的一种失败：卡片上只有一串
+      // 🔧/✅ 工具记录，然后就没有然后了。用户看到的是"它跑了一堆工具，结果呢？"
+      // 而代码这边认为"成功"。静默结束比报错糟得多，所以在这里必须明说。
+      if (!answer.trim()) {
+        const why =
+          "模型这一轮没给出文字回答（多半是工具步数用尽、或上游返回了空内容）。" +
+          "把问题拆小一点、或限定范围再问一次通常就好了。";
+        if (live) {
+          await streamer.fail(why);
+          return { text: "", streamed: true };
+        }
+        return { text: why, streamed: false };
+      }
+
       if (live) {
         await streamer.finish(answer);
         return { text: answer, streamed: true };
@@ -943,8 +974,21 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
       stopWhen: stepCountIs(MAX_STEPS),
       // 最后一步把工具摘掉，逼它用文字收尾。
       // 不加这个，循环会停在"刚调完工具"那一拍，最终 text 为空 —— 页面上就是工具全跑完了却永远没有回答。
-      prepareStep: ({ stepNumber }) =>
-        stepNumber >= MAX_STEPS - 1 ? { activeTools: [] } : undefined,
+      //
+      // ⚠️ 只摘工具**还不够**（实测：飞书上会出现"一串 🔧/✅ 之后没有结论"）。
+      // 模型的注意力还在"下一步要调什么工具"上，突然发现手上没工具了，很容易
+      // 就吐一个空回复 —— 摘掉工具是"不让你做"，还得明说"现在要做什么"。
+      // 所以补一条显式指令，并且点名"必须有文字回答"。
+      prepareStep: ({ stepNumber, messages }) =>
+        stepNumber >= MAX_STEPS - 1
+          ? {
+              activeTools: [],
+              messages: [
+                ...messages,
+                { role: "user" as const, content: FINAL_STEP_NUDGE },
+              ],
+            }
+          : undefined,
       // 飞书流式：把**思考、工具调用、答案**按到达顺序接进同一张卡片。
       // 网页那条路 `feishuStream` 是 null，这里是空转。
       //
