@@ -20,6 +20,15 @@ export interface AliyunConfig {
   apiKey: string;
   /** 模板名，默认 code-interpreter-v1 */
   template: string;
+  /**
+   * 每次执行时注入沙箱的环境变量。
+   *
+   * ⚠️ **不能用创建沙箱时的 `envs` 字段** —— 实测阿里云忽略了它：请求成功返回
+   * 201，但沙箱进程里根本看不到那些变量。所以改成在执行包装层 `export`，
+   * 每次跑代码时现导一次。副作用是模型代码只能通过 `os.environ` 读，
+   * 拿不到"沙箱启动时就存在"的语义 —— 对我们够用了。
+   */
+  envs?: Record<string, string>;
 }
 
 export interface SandboxHandle {
@@ -135,12 +144,23 @@ export interface SandboxExecRequest {
 export async function execInSandbox(
   sbx: SandboxHandle,
   req: SandboxExecRequest,
+  /** 每次执行前 export 进沙箱的变量，见 AliyunConfig.envs 的说明 */
+  envs?: Record<string, string>,
 ): Promise<RunResult> {
   // ⚠️ 这里**不清理**工作目录。沙箱是跨调用复用的，"上次写下的文件还在"
   // 正是有状态契约的一部分（工具描述里也是这么写的）。清掉它会让
   // "装了包、写了文件，下次还能用"这个承诺当场失效。
   // 每次会覆盖 main.py 和 files 里列出的同名文件，这没问题。
   const lines = ["set -e", "mkdir -p /tmp/cfal && cd /tmp/cfal"];
+
+  // 凭证走 base64 落地再 export：值里可能有引号、换行、$ 之类，
+  // 直接拼进 shell 命令会被吃掉或执行。变量名做严格校验，挡住注入。
+  for (const [k, v] of Object.entries(envs ?? {})) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) {
+      throw new Error(`环境变量名不合法：${k}`);
+    }
+    lines.push(`export ${k}="$(printf %s '${textToBase64(v)}' | base64 -d)"`);
+  }
   for (const f of req.files ?? []) {
     // 只取 basename：不给 ../ 之类任何跳出工作目录的机会
     const name = f.name.split("/").pop() || "file";
@@ -199,6 +219,7 @@ export async function installPackages(
   sbx: SandboxHandle,
   packages: string[],
   timeoutMs: number,
+  envs?: Record<string, string>,
 ): Promise<RunResult> {
   // 包名做严格校验：它会被拼进 shell 命令，不能让它带空格、引号、分号
   const bad = packages.filter((p) => !/^[A-Za-z0-9._-]+(\[[A-Za-z0-9._,-]+\])?$/.test(p));
@@ -215,5 +236,5 @@ export async function installPackages(
     'print((r.stderr or "")[-3000:], file=sys.stderr)',
     "sys.exit(r.returncode)",
   ].join("\n");
-  return execInSandbox(sbx, { code, timeoutMs });
+  return execInSandbox(sbx, { code, timeoutMs }, envs);
 }

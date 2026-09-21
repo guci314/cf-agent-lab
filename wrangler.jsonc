@@ -37,6 +37,15 @@
       "storage": "sqlite"
     }
   },
+  // 不是密钥，是配置，所以放这里而不是 secret —— 版本化、可 review。
+  //
+  // ALIYUN_SANDBOX_ENVS：这些环境变量会在每次 run_python 时注入沙箱。
+  // ⚠️ 注入之后沙箱里任何代码都能读到它，而沙箱跑的是模型写的代码 ——
+  // 只放确实需要、且愿意承受这个暴露面的凭证。
+  "vars": {
+    "ALIYUN_SANDBOX_ENVS": "OPENCODE_API_KEY"
+  },
+
   "observability": {
     "enabled": true
   }

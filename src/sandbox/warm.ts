@@ -74,7 +74,7 @@ export class WarmSandbox {
   async run(req: SandboxExecRequest): Promise<RunResult> {
     const h = await this.handle();
     try {
-      return await execInSandbox(h, req);
+      return await execInSandbox(h, req, this.cfg.envs);
     } catch (e) {
       await this.store.set(null);
       throw e;
@@ -85,7 +85,7 @@ export class WarmSandbox {
   async install(packages: string[], timeoutMs: number): Promise<RunResult> {
     const h = await this.handle();
     try {
-      return await installPackages(h, packages, timeoutMs);
+      return await installPackages(h, packages, timeoutMs, this.cfg.envs);
     } catch (e) {
       await this.store.set(null);
       throw e;

@@ -56,6 +56,15 @@ export interface SandboxEnv {
   ALIYUN_SANDBOX_TEMPLATE?: string;
   /** 沙箱存活秒数，默认 900。越大复用越久，但也越久才回收 */
   ALIYUN_SANDBOX_TTL_SEC?: string;
+  /**
+   * 逗号分隔的环境变量**名**，这些变量会在每次执行时注入沙箱，
+   * 沙箱里的代码 `os.environ[...]` 就能读到。例如 `OPENCODE_API_KEY`。
+   *
+   * ⚠️ 注入 = 沙箱里任何代码都能读到它。而沙箱跑的是模型写的代码，
+   * 触发方是任何能跟这个 agent 说话的人（飞书那边只有 open_id 白名单兜着）。
+   * 所以**只放确实需要的、且愿意承受这个暴露面的凭证**。
+   */
+  ALIYUN_SANDBOX_ENVS?: string;
 }
 
 const DEFAULT_EXECUTOR_PACKAGES = "numpy / pandas / openai-agents";
@@ -70,6 +79,18 @@ export function sandboxConfig(env: SandboxEnv) {
   const executorKey = (env.EXECUTOR_KEY ?? "").trim();
   const aliyunKey = (env.ALIYUN_SANDBOX_API_KEY ?? "").trim();
   const ttl = Number(env.ALIYUN_SANDBOX_TTL_SEC ?? "");
+
+  // 按名单把值取出来。**只把真正取到的算作"已注入"** —— 名单里写了名字但
+  // 变量本身没配（拼错、或忘了设 secret），要能被看出来，否则会变成
+  // "以为沙箱里有 key、实际上线才发现没有"的坑。
+  const sandboxEnvs: Record<string, string> = {};
+  for (const name of (env.ALIYUN_SANDBOX_ENVS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)) {
+    const v = (env as unknown as Record<string, unknown>)[name];
+    if (typeof v === "string" && v) sandboxEnvs[name] = v;
+  }
   return {
     enabled: off !== "0" && off !== "false" && off !== "off",
     // URL 和 KEY 都配齐才算数。只配了 URL 的话请求会被 401 掉，
@@ -81,8 +102,11 @@ export function sandboxConfig(env: SandboxEnv) {
           apiKey: aliyunKey,
           apiBase: (env.ALIYUN_SANDBOX_API_BASE ?? "").trim() || DEFAULT_ALIYUN_API_BASE,
           template: (env.ALIYUN_SANDBOX_TEMPLATE ?? "").trim() || DEFAULT_ALIYUN_TEMPLATE,
+          envs: Object.keys(sandboxEnvs).length > 0 ? sandboxEnvs : undefined,
         }
       : null,
+    /** 真正注入了沙箱的变量名。工具描述按它说话，别把没配的也说成有 */
+    envNames: Object.keys(sandboxEnvs),
     ttlSec: Number.isFinite(ttl) && ttl > 0 ? Math.trunc(ttl) : DEFAULT_ALIYUN_TTL_SEC,
     packages: (env.EXECUTOR_PACKAGES ?? "").trim() || DEFAULT_EXECUTOR_PACKAGES,
     baseUrl: (env.SANDBOX_URL ?? "").trim() || DEFAULT_BASE_URL,
@@ -155,7 +179,12 @@ function describeBackend(cfg: ReturnType<typeof sandboxConfig>): string {
       "需要多步就写成一个脚本一次跑完。\n" +
       "③ 有网络，**而且能装包**：要装库用 `install_python_package` 工具，" +
       "不要写在 run_python 的代码里 —— run_python 的墙钟（" + WALL_TIME_LIMIT +
-      " 秒）装不完一个包。模板已预装 numpy / pandas。\n"
+      " 秒）装不完一个包。模板已预装 numpy / pandas。\n" +
+      // 只列**真正注入成功**的变量名。名单里写了但没配上的不算，
+      // 否则模型会照着描述去 os.environ["X"] 然后拿到 KeyError。
+      (cfg.envNames.length > 0
+        ? `④ 沙箱里已注入环境变量：${cfg.envNames.map((n) => `\`${n}\``).join("、")}，用 os.environ[...] 读。\n`
+        : "")
     );
   }
   if (cfg.executor) {

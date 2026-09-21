@@ -65,6 +65,13 @@ interface Env {
   /** 沙箱存活秒数，默认 900。它是「装一次包一直能用」的时长上限 */
   ALIYUN_SANDBOX_TTL_SEC?: string;
   /**
+   * 逗号分隔的环境变量名，会在每次执行时注入沙箱（例如 `OPENCODE_API_KEY`）。
+   *
+   * ⚠️ 注入之后，**沙箱里任何代码都能读到它** —— 而沙箱跑的是模型写的代码。
+   * 只放确实需要、且愿意承受这个暴露面的凭证。
+   */
+  ALIYUN_SANDBOX_ENVS?: string;
+  /**
    * 自建执行器（`executor/`）的地址与共享密钥。**两个都配齐**才走它；
    * 否则退回 Judge0 公共实例（那个装不了包、也不许出网）。
    */
@@ -841,6 +848,18 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
         (st.capped ? "注意：因为体积上限，只有部分文件进了索引。" : "")
       : `${SYSTEM_PROMPT}\n\n当前还没有导入代码仓库。如果用户问的是仓库里的代码，先提醒他用 /repo owner/name 导入。`;
 
+    // 沙箱里注入了模型凭证时，把**怎么用它**一并说清楚。
+    //
+    // 只说"沙箱里有个 OPENCODE_API_KEY"等于没说：base_url、必须带的
+    // `x-opencode-session` 头、可用的模型名，这些都不在代码里、也不在沙箱里，
+    // 是外部知识。不写清楚，模型只能靠猜 —— 而猜错要烧掉一整轮。
+    const llmHint = sandboxConfig(this.envRef).envNames.includes("OPENCODE_API_KEY")
+      ? "\n\n沙箱里可以用 `OPENCODE_API_KEY` 调模型（`openai-agents` 之类的库都能用）：" +
+        "base_url 填 `https://opencode.ai/zen/go/v1`，**必须**带请求头 " +
+        "`x-opencode-session`（值取一个固定字符串即可，缺了会被 400 拒掉）。" +
+        "可用的模型如 `deepseek-v4.1-flash`、`mimo-v2.5`。"
+      : "";
+
     // 飞书会话（实例名 `fs-` 开头）的回答是走**流式卡片**发的，而卡片**渲染 Markdown**。
     //
     // ⚠️ 这里以前写的是反过来的：那会儿回答走 `text` 消息，飞书不渲染 Markdown，
@@ -848,12 +867,13 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
     // 引用代码正是这个产品的主业，平铺反而难读。
     //
     // 唯一保留的约束是**宽表格**：卡片在手机上的宽度很窄，宽表格要横向滚动才看得全。
-    const system = this.isFeishuChannel
-      ? base +
-        "\n\n注意：回答会显示在飞书的卡片里，**支持 Markdown** —— 代码块、`行内代码`、列表、加粗都能正常渲染。" +
-        "引用代码时用代码块并标出行号，行内提到标识符用反引号，比平铺更好读。" +
-        "只有一个要避开：**别用宽表格**（手机上的卡片很窄，宽表格要横向滚动才看得全），需要对比时改用列表。回答尽量短。"
-      : base;
+    const system =
+      (this.isFeishuChannel
+        ? base +
+          "\n\n注意：回答会显示在飞书的卡片里，**支持 Markdown** —— 代码块、`行内代码`、列表、加粗都能正常渲染。" +
+          "引用代码时用代码块并标出行号，行内提到标识符用反引号，比平铺更好读。" +
+          "只有一个要避开：**别用宽表格**（手机上的卡片很窄，宽表格要横向滚动才看得全），需要对比时改用列表。回答尽量短。"
+        : base) + llmHint;
 
     const result = streamText({
       model: opencode(this.env)(MODEL),
