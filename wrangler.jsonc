@@ -43,7 +43,10 @@
   // ⚠️ 注入之后沙箱里任何代码都能读到它，而沙箱跑的是模型写的代码 ——
   // 只放确实需要、且愿意承受这个暴露面的凭证。
   "vars": {
-    "ALIYUN_SANDBOX_ENVS": "OPENCODE_API_KEY"
+    "ALIYUN_SANDBOX_ENVS": "OPENCODE_API_KEY",
+    // 「代码仓库助手」bot 的 EdgeOne 转发目标（密钥走 wrangler secret）：
+    // EO_BOT_VERIFICATION_TOKEN / EO_BOT_ENCRYPT_KEY / EO_INTERNAL_TOKEN
+    "EO_AGENT_URL": "https://eolab.yujizi.org/feishu"
   },
 
   "observability": {

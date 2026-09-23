@@ -28,6 +28,7 @@ import { resolveDefaultBranch } from "./workspace/github.ts";
 import { makeGithubTools } from "./ghworkspace/tools.ts";
 import { ghWorkspaceConfig, type GhWorkspaceConfig } from "./ghworkspace/client.ts";
 import { handleFeishuRoutes } from "./feishu/router.ts";
+import { handleEdgeOneRelayRoutes } from "./feishu/edgeone-relay.ts";
 import type { FeishuQueueEvent } from "./feishu/router.ts";
 import { FeishuStore } from "./feishu/store.ts";
 import { FeishuStreamer } from "./feishu/streamer.ts";
@@ -51,6 +52,12 @@ interface Env {
   FEISHU_ALLOWED_OPEN_IDS?: string;
   /** 只为本地测试：把飞书 API 指到 mock 上。生产不要设 */
   FEISHU_API_BASE?: string;
+  // ── EdgeOne 转发（「代码仓库助手」bot，见 feishu/edgeone-relay.ts）──
+  EO_BOT_VERIFICATION_TOKEN?: string;
+  EO_BOT_ENCRYPT_KEY?: string;
+  /** 非密钥配置，走 vars */
+  EO_AGENT_URL?: string;
+  EO_INTERNAL_TOKEN?: string;
   // ── 代码沙箱（run_python）。全可选，默认开启 ──────────────────
   /** 设成 0 / false / off 即关闭 run_python。不设 = 开启 */
   SANDBOX_ENABLED?: string;
@@ -1031,7 +1038,7 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     // ── 飞书回调 ────────────────────────────────────────────────────
     // ⚠️ 必须放在**最前面**，在密码门之前。两个理由：
     // ① 飞书不会带我们的 cookie，进了门就永远 401；
@@ -1039,6 +1046,10 @@ export default {
     //    不该因为 PAGE_PASSWORD 忘了配就被连带打死。
     const feishu = await handleFeishuRoutes(request, env);
     if (feishu) return feishu;
+
+    // 「代码仓库助手」→ EdgeOne 的转发入口（密钥独立于上面的问答 bot）
+    const edgeone = await handleEdgeOneRelayRoutes(request, env, ctx);
+    if (edgeone) return edgeone;
 
     const password = env.PAGE_PASSWORD;
 
