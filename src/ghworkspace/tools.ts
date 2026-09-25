@@ -1,17 +1,18 @@
 // 工作区仓库的读写工具。
 //
-// ⚠️ 这一族和 workspace/tools.ts 的 read / ls / grep / find **读写的是两个完全不同的仓库**：
-//   那四个 —— 用户导入的代码快照，只读，存在 DO 的 SQLite 里
-//   这四个 —— agent 自己的 GitHub 私有仓库，可写，每次写都是一次真实 commit
-// 命名上刻意不共用任何词，工具描述里也要反复点明，否则模型一定会拿错工具读错仓库
-// （两边都有"读文件"的形状，光看输入参数分不出来）。
+// 这一族读写的是 **agent 自己的 GitHub 私有仓库**（可写，每次写都是一次真实 commit），
+// 不是用户的代码。
 //
-// 所有 execute 都过 `guarded`（workspace/tools.ts）：工具抛错会中断整个工具循环，
+// ⚠️ 2026-09-25 之前，这里必须反复强调「别和 read / ls / grep / find 拿混」—— 那四个
+// 读的是**用户导入的**代码快照，两边都有「读文件」的形状，光看输入参数分不出来，模型
+// 一定会拿错。现在那一族已随仓库层删除，**手上只剩这一族文件工具了**，所以那段辨析
+// 也删掉了。保留这段注释是为了说明：如果以后再加第二个文件工具族，这个坑会回来。
+//
+// 所有 execute 都过 `guarded`（shared/util.ts）：工具抛错会中断整个工具循环，
 // 一律转成 `{ error }` 让模型自己看到并调整。
 
 import { jsonSchema, tool } from "ai";
-import { guarded } from "../workspace/tools.ts";
-import { utf8Len } from "../workspace/filter.ts";
+import { guarded, utf8Len } from "../shared/util.ts";
 import type { GhFile } from "./client.ts";
 import {
   checkPath,
@@ -23,8 +24,8 @@ import {
   type GhWorkspaceConfig,
 } from "./client.ts";
 
-// 和 workspace/tools.ts 的 read / ls 刻意用同一组数值：契约一致，模型已有的
-// 使用习惯才能直接迁移过来。
+// 这几个上限刻意沿用「只读代码工具」那代定下的数值：契约一致，
+// 模型已有的使用习惯可以直接迁移过来。
 //
 // ⚠️ 注意 GitHub Contents API **不支持分段读取** —— 这里的 offset/limit 是在
 // 取回全文之后**在本地切片**。它管的是"喂给模型的上下文有多大"，不是省流量。
@@ -103,7 +104,7 @@ export function makeGithubTools(cfg: GhWorkspaceConfig | null) {
           const listed = await usageError(() => listDir(cfg, dir));
           if ("error" in listed) return listed;
           const entries = listed;
-          // 目录在前、同级按名称升序 —— 和 workspace 的 ls 保持同一套排序
+          // 目录在前、同级按名称升序 —— 沿用「只读代码工具」那代的排序口径
           entries.sort((a, b) =>
             a.type === b.type ? a.name.localeCompare(b.name) : a.type === "dir" ? -1 : 1,
           );

@@ -7,7 +7,7 @@ dist/
 .dev.vars.*
 
 # ⚠️ wrangler 的本地状态，含 Durable Object 的 SQLite ——
-# 也就是**真实的对话历史与导入的仓库内容**，不是缓存
+# 也就是**真实的对话历史**，不是缓存
 .wrangler/
 
 # 杂项

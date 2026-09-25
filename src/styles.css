@@ -235,7 +235,6 @@ button:disabled { opacity: 0.5; cursor: progress; }
 /* 键盘可达性：只在键盘聚焦时显形，鼠标点击不会留一圈框 */
 :focus-visible { outline: 2px solid var(--pen); outline-offset: 2px; }
 form input:focus-visible,
-.ws-row input:focus-visible,
 .meta input:focus-visible { outline-offset: -1px; }
 
 .ghost {
@@ -260,53 +259,6 @@ form input:focus-visible,
 }
 .note { font-size: 11.5px; color: var(--ink-soft); white-space: normal; }
 
-/* ── 仓库面板 ──────────────────────────────────────────────────────── */
-.ws {
-  flex: 0 0 auto;
-  display: flex; flex-direction: column; gap: 8px;
-  padding: 12px 14px;
-  border: 1px solid var(--rule); border-radius: var(--radius-sheet);
-  background: var(--sheet);
-}
-/* 按**可用宽度**换行，不靠断点。
-   给仓库框 220px 的 flex-basis：放得下就并排，放不下它自己占满一行、
-   分支框和按钮落到第二行。算的是实际可用宽度，所以 320→760 之间连续过渡，
-   不会在某个断点两侧突然跳一下。220px 不随意：约等于能看清一段 owner/repo。 */
-.ws-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.ws-row input {
-  flex: 1 1 220px; min-width: 0;
-  font: inherit; font-size: 13px; padding: 7px 10px;
-  border: 1px solid var(--rule); border-radius: var(--radius-ctl);
-  background: var(--paper); color: var(--ink);
-}
-.ws-row .ws-ref { flex: 0 1 110px; font-family: var(--mono); font-size: 12px; }
-.ws-row button { flex: 0 0 auto; padding: 7px 16px; font-size: 13px; }
-
-.ws-status {
-  display: flex; gap: 12px; flex-wrap: wrap; align-items: baseline;
-  font-size: 12.5px;
-  /* ⚠️ 状态行里会出现不可断的长串（长仓库名、长路径），撑破容器就会让整页横向可拖 */
-  overflow-wrap: anywhere;
-}
-.ws-status > * { min-width: 0; }
-.ws-dim { color: var(--ink-soft); }
-.ws-path {
-  flex-basis: 100%;
-  min-width: 0;
-  font-family: var(--mono); font-size: 11.5px;
-  /* ⚠️ 这里曾经是 `white-space: nowrap` + 省略号，本意单行截断。
-     但导入进度里的路径动辄四五十字符，窄屏下被撑到 589px（视口才 344px），
-     **整个页面因此可以横向拖动**。
-     nowrap 放在 flex 子项上，等于给容器设了一个"不可收缩"的下限。 */
-  overflow-wrap: anywhere;
-}
-.ws-warn { color: var(--warn); font-weight: 600; }
-.ws-error {
-  font-size: 12.5px; color: var(--danger);
-  white-space: pre-wrap; overflow-wrap: anywhere;
-  border-left: 2px solid var(--danger); padding-left: 8px;
-}
-
 /* ── 窄屏 ────────────────────────────────────────────────────────────
    注意这里**只做两件事**：把输入框字号顶到 16px、把留白收紧。
    换行、滚动、贴底这些都不在这里做——骨架已经保证了，再用断点补一遍
@@ -322,11 +274,7 @@ form input:focus-visible,
   h1 { font-size: 16.5px; }
   .sub { font-size: 12px; }
   .meta input,
-  .ws-row input,
   form input { font-size: 16px; }
-  .ws-row input { padding: 9px 11px; }
-  .ws-row button { padding: 10px 18px; }
-  .ws-row .ws-ref { font-size: 15px; }
   .ghost { padding: 8px 13px; font-size: 13px; }
   .preview { height: 55dvh; }
 }

@@ -14,7 +14,7 @@
 //   限额 5000 次/小时
 
 import { fromBase64, textToBase64 } from "../sandbox/base64.ts";
-import { UA } from "../workspace/github.ts";
+import { UA } from "../shared/util.ts";
 
 export const DEFAULT_API_BASE = "https://api.github.com";
 /** 仓库名不是密钥，硬编码默认值；要改指向就用 GITHUB_WORKSPACE_REPO */

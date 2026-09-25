@@ -2,7 +2,6 @@ import { useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { useAgent } from "agents/react";
 import { useAgentChat } from "@cloudflare/ai-chat/react";
-import { WorkspacePanel, type WorkspaceState } from "./workspace-panel.tsx";
 import "./styles.css";
 
 type Part = { type: string; text?: string; input?: unknown };
@@ -22,13 +21,16 @@ const CITE_SRC =
 const CITE_ALL = new RegExp(CITE_SRC, "g");
 const CITE_FULL = new RegExp("^(?:" + CITE_SRC + ")$");
 
-// 回答里的 `src/server.ts:42` 是**这个产品的核心承诺**，不能和正文一个样。
-// 但这里是纯文本渲染：模型很爱用反引号包路径，不处理的话页面上会直接露出反引号，
-// 而真正的引用又埋没在句子里。
+// 回答里的 `src/server.ts:42` 这类「路径:行号」是模型的常见引用形式，值得单独上色，
+// 不能和正文一个样。但这里是纯文本渲染：模型很爱用反引号包路径，不处理的话页面上会
+// 直接露出反引号，而真正的引用又埋没在句子里。
 //
 // 刻意不做完整 markdown（标题、列表、表格会引出新的排版问题），只做两件事：
 //   反引号 → 代码样式；其中的「路径:行号」 → 钴蓝引用样式，比普通代码更重。
 // 反引号个数为奇数时（模型写残了）整段放弃处理，原样输出 —— 总比乱切强。
+//
+// （2026-09-25：这段原先注释说「路径:行号 是这个产品的核心承诺」—— 那是
+// 「代码仓库问答」时代的定位。现在是通用助手，引用代码只是顺带，样式留着。）
 function rich(text: string): ReactNode[] {
   const segments = text.split("`");
   if (segments.length % 2 === 0) return [text];
@@ -76,7 +78,7 @@ type Chip = { name: string; arg: string; web: boolean };
 //
 // 拆成 name / arg 两段（而不是拼成"搜代码：xxx"一句话），是为了让出处槽能把它
 // 排成两列——左列工具名、右列目标。右列才是真正要读的东西。
-// web 标记用来区分"在仓库里找的"和"仓库外查的"，对应 CSS 里的实线/虚线。
+// web 标记用来区分"上网查的"和"跑代码/写工作区的"，对应 CSS 里的实线/虚线。
 function toolChip(p: Part): Chip | null {
   if (!p.type.startsWith("tool-")) return null;
   const name = p.type.slice("tool-".length);
@@ -133,7 +135,6 @@ function ChatPane({ instance }: { instance: string }) {
 
   const agent = useAgent<{
     compactCalls?: number;
-    workspace?: WorkspaceState;
   }>({
     agent: "ChatAgent",
     name: instance,
@@ -156,14 +157,11 @@ function ChatPane({ instance }: { instance: string }) {
         </button>
       </div>
 
-      <WorkspacePanel instance={instance} workspace={agent.state?.workspace} />
-
       <div className="log">
         {messages.length === 0 && (
           <div className="msg bot">
-            先在上面导入一个 GitHub 仓库，然后问它。
-            比如「登录逻辑写在哪」「这个功能的入口函数是什么」——回答会标出行号，
-            上面那条竖线里列的是它为找答案读过的文件和搜索。
+            直接问就行 —— 它会搜网页、跑代码来回答。
+            上面那条竖线里列的是它为找答案查过的页面和跑过的脚本。
           </div>
         )}
         {messages.map((m) => {
@@ -208,7 +206,7 @@ function ChatPane({ instance }: { instance: string }) {
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="例如：这个仓库的请求是怎么路由的？"
+          placeholder="例如：帮我查一下 XX 现在的情况，并算一下…"
           autoComplete="off"
         />
         <button type="submit" disabled={busy}>
@@ -225,8 +223,8 @@ function App() {
   return (
     <div className="app">
       <header>
-        <h1>代码仓库问答</h1>
-        <span className="sub">粘贴一个 GitHub 仓库，然后问它代码写在哪。</span>
+        <h1>通用助手</h1>
+        <span className="sub">会搜网页、跑代码、写工作区笔记。</span>
       </header>
 
       <div className="meta">

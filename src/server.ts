@@ -18,13 +18,8 @@ import {
   loginPage,
   passwordMatches,
 } from "./auth.ts";
-import { WorkspaceRepo } from "./workspace/repo.ts";
-import { makeWorkspaceTools } from "./workspace/tools.ts";
 import { makeSandboxTools, sandboxConfig } from "./sandbox/tool.ts";
 import { WarmSandbox, type SandboxStore, type StoredSandbox } from "./sandbox/warm.ts";
-import { handleWorkspaceRoutes } from "./workspace/routes.ts";
-import { serveIngest } from "./workspace/serve-ingest.ts";
-import { resolveDefaultBranch } from "./workspace/github.ts";
 import { makeGithubTools } from "./ghworkspace/tools.ts";
 import { ghWorkspaceConfig, type GhWorkspaceConfig } from "./ghworkspace/client.ts";
 import { handleFeishuRoutes } from "./feishu/router.ts";
@@ -33,7 +28,6 @@ import type { FeishuQueueEvent } from "./feishu/router.ts";
 import { FeishuStore } from "./feishu/store.ts";
 import { FeishuStreamer } from "./feishu/streamer.ts";
 import { runFeishuTurn } from "./feishu/turn.ts";
-import type { IngestFile } from "./workspace/types.ts";
 
 interface Env {
   ChatAgent: DurableObjectNamespace;
@@ -108,16 +102,6 @@ interface Env {
 
 type ChatState = {
   compactCalls: number;
-  // 导入状态写进 state，页面刷新后还能看到「已导入 N 个文件」
-  workspace?: {
-    status: string;
-    owner: string;
-    name: string;
-    ref: string;
-    fileCount: number;
-    totalBytes: number;
-    capped: boolean;
-  };
   // 探针结果。本机 wrangler tail 抓不到日志，只能靠把它写进 state 再从页面读
   probe?: Record<string, unknown>;
 };
@@ -141,30 +125,31 @@ const opencode = (env: Env) =>
     headers: { "x-opencode-session": "cf-agent-lab" },
   });
 
-// 人格已经从「企业内助手」换成专职的代码仓库阅读助手。
-// 几条规矩不是客套话，各自对应一种实际会犯的错：
-// 「不要猜路径」——模型倾向于编一个看着合理的路径然后读不到；
-// 「搜不到不是错误」——不写清楚它会因为空结果反复重试同一个搜索；
-// 「截断就缩小范围」——不写清楚它会拿半截结果当完整的下结论。
+// 人格：通用助手。
+//
+// 2026-09-25 之前是「代码仓库阅读助手」—— 用户先导入一个 GitHub 仓库，再问那个仓库的
+// 代码。那一层（`src/workspace/*` + 网页的「代码仓库」面板 + 飞书的 `/repo`）已整层删除，
+// 现在没有任何「导入的仓库」，所以提示词里也**不能再提** read / ls / grep / find 那四个
+// 工具 —— 提示词没说的能力模型不会想到，反过来**说了但手上没有的能力，它会去调然后白烧一轮**。
+//
+// 下面几条规矩不是客套话，各自对应一种实际会犯的错：
+// 「不确定就说不确定」—— 不写清楚它会为了把话说圆而编；
+// 「搜不到不是错误」—— 不写清楚它会因为空结果反复重试同一个搜索；
+// 「给出来源」—— 网页来的结论和它自己推的结论必须能分辨。
 const SYSTEM_PROMPT =
-  "你是一个代码仓库阅读助手。用户导入的仓库你可以用 read / ls / grep / find 只读地查看。" +
-  "回答必须基于你实际读到的代码，不要凭印象或常识推测；仓库里看不到就说看不到。" +
-  "引用代码一律给出「路径:行号」（如 src/server.ts:42），方便用户跳转。" +
-  "找东西先用 grep 搜内容、用 find 找路径，不要凭猜测拼路径。" +
-  "搜索没有结果不是错误，换个关键词或放宽范围再试。" +
-  "工具结果被截断时，加 path 或 glob 缩小范围再查一次，不要基于半截结果下结论。" +
-  "仓库里确实没有答案时，可以用 web_search / fetch_page 查外部资料，但要说明那是仓库外的信息。" +
-  // 沙箱结果和仓库内容必须分开说。不写这条，模型会把「我跑出来是这样」直接
-  // 当成「这个仓库就是这样」—— 而沙箱里跑的是它自己写的脚本，不是仓库的代码。
-  "需要验算算法、正则或复现某段逻辑时，可以用 run_python 在沙箱里跑一小段 Python。" +
-  // ⚠️ 这里曾经写死「只有标准库、无网络、每次调用互不相干」—— 那是 Judge0 那代后端的
-  // 事实，换成阿里云沙箱后已经不成立（有网、能 pip、跨调用复用）。同一件事两处说法不一，
-  // 模型会照错的那份走：明明能装 pandas 却用标准库硬凑。沙箱能力**随后端变**，
-  // 所以这里不复述，指向工具描述那份唯一的真相（describeBackend 是按后端生成的）。
+  "你是一个通用助手，通过对话帮人解决问题。" +
+  "你手上只有三类工具：搜网页（web_search / fetch_page）、跑代码（run_python）、" +
+  "以及一个自己的 GitHub 工作区仓库（ws_* 那族，用来长期留存产出）。" +
+  "需要事实、最新信息、或你不确定的东西时，**先用 web_search 查**，不要凭记忆作答；" +
+  "查到具体页面再 fetch_page 读正文。" +
+  "引用外部信息要给出处（链接或站点名），把「网上查到的」和「你自己推的」分清楚。" +
+  "搜索没有结果不是错误，换个关键词或放宽范围再试；试过还是查不到，就说查不到，" +
+  "**不要编一个看起来合理但没查过的答案**。" +
+  "需要验算、处理数据、或验证一段逻辑时，用 run_python 在沙箱里跑，" +
+  "但要把沙箱结果和事实分清楚：那是你自己写的脚本跑出来的，" +
+  "引用时要说明「按上述逻辑推演」而不是当成既有事实。" +
   "沙箱的具体能力（有没有网、能不能装包、是否跨调用保留文件）**随后端不同**，" +
   "以 run_python 工具描述里列的那几条为准，不要凭印象假设。" +
-  "但要把沙箱结果和仓库内容分清楚：那是你自己写的脚本跑出来的，不是仓库里既有的事实，" +
-  "引用时要说明「按上述逻辑推演」而不是当成「仓库里写着」。" +
   "回答简洁，不要客套。";
 
 // 超过这个估算 token 数就压缩，压缩后保留最近 N token 逐字。
@@ -394,8 +379,6 @@ function summarizeToolOutput(output: unknown): string {
 }
 
 export class ChatAgent extends AIChatAgent<Env, ChatState> {
-  // 只持有 sql 句柄，每请求复用，不必反复 new
-  repo: WorkspaceRepo;
   feishu: FeishuStore;
   // 自己存一份：基类上有没有 `this.env` 我没核实出来，不赌这个
   private readonly envRef: Env;
@@ -426,10 +409,6 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
   constructor(ctx: AgentContext, env: Env) {
     super(ctx, env);
     this.envRef = env;
-
-    this.repo = new WorkspaceRepo(this.ctx.storage.sql);
-    // DDL 幂等，每实例一次即可，不必每个请求都跑
-    this.repo.ensureSchema();
 
     this.feishu = new FeishuStore(this.ctx.storage.sql);
     this.feishu.ensureSchema();
@@ -463,8 +442,9 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
   // 只被压缩调用——写进 agent state 是为了能从页面读出它真跑过（本机 wrangler tail 抓不到日志）
   private async summarize(prompt: string): Promise<string> {
     const compactCalls = (this.state?.compactCalls ?? 0) + 1;
-    // ⚠️ setState 是整体替换、不是浅合并 —— 必须 spread，
-    // 否则 summarize 一跑就把 workspace 字段静默抹掉
+    // ⚠️ setState 是整体替换、不是浅合并 —— 必须 spread。
+    // 漏了 spread 就会把 state 里别的字段（比如 probe）静默抹掉，
+    // 而且不报错、不提示，表现为「那个字段莫名其妙空了」。
     this.setState({ ...this.state, compactCalls });
 
     const { text } = await generateText({
@@ -474,52 +454,6 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
     });
 
     return text;
-  }
-
-  // ── 导入协议（由 Worker 经原生 RPC 调用，见 workspace/routes.ts）──────
-
-  async workspaceBegin(
-    owner: string,
-    name: string,
-    ref: string,
-    ingestId: string,
-  ): Promise<{ generation: number }> {
-    return this.repo.beginIngest(owner, name, ref, ingestId);
-  }
-
-  async workspaceIngest(ingestId: string, files: IngestFile[]) {
-    return this.repo.ingestBatch(ingestId, files);
-  }
-
-  async workspaceFinish(ingestId: string, skipped: number, capped: boolean) {
-    const r = this.repo.finishIngest(ingestId, skipped, capped);
-    this.syncWorkspaceState();
-    return r;
-  }
-
-  async workspaceFail(ingestId: string, error: string): Promise<void> {
-    this.repo.failIngest(ingestId, error);
-    this.syncWorkspaceState();
-  }
-
-  async workspaceStatus() {
-    return this.repo.status();
-  }
-
-  private syncWorkspaceState(): void {
-    const s = this.repo.status();
-    this.setState({
-      ...this.state,
-      workspace: {
-        status: s.status,
-        owner: s.owner,
-        name: s.name,
-        ref: s.ref,
-        fileCount: s.fileCount,
-        totalBytes: s.totalBytes,
-        capped: s.capped,
-      },
-    });
   }
 
   // ── 飞书 ────────────────────────────────────────────────────────────
@@ -568,7 +502,6 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
     await runFeishuTurn(
       {
         ask: (text, messageId, chatId) => this.feishuAsk(text, messageId, chatId),
-        ingest: (owner, name, ref) => this.feishuIngest(owner, name, ref),
         statusText: () => this.feishuStatusText(),
       },
       this.envRef,
@@ -666,38 +599,19 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
     }
   }
 
-  private async feishuIngest(
-    owner: string,
-    name: string,
-    ref: string,
-  ): Promise<string> {
-    const r = await serveIngest(this.repo, owner, name, ref);
-    this.syncWorkspaceState();
-
-    const kb = r.totalBytes < 1024 ? `${r.totalBytes}B` : `${Math.round(r.totalBytes / 1024)}KB`;
-    const lines = [
-      `已入库 ${owner}/${name}@${ref}`,
-      `${r.fileCount} 个文件 · ${kb}${r.skipped > 0 ? ` · 跳过 ${r.skipped}` : ""}`,
-    ];
-    if (r.truncatedBy === "corpus" || r.truncatedBy === "entries") {
-      lines.push("（撞到体积/数量上限，只索引了部分文件）");
-    } else if (r.truncatedBy === "time") {
-      lines.push("（抓取超时，只索引了一部分 —— 可以再发一次，或者选个小点的仓库）");
-    }
-    lines.push("现在可以直接问代码问题了。");
-    return lines.join("\n");
-  }
-
+  /**
+   * `/status` 的一句话。
+   *
+   * 2026-09-25 之前这里报的是「当前导入了哪个仓库、多少文件」。仓库层删掉之后
+   * 改报**这个会话自己的状态** —— `/status` 命令本身保留：命令集保持稳定，
+   * 而「聊了多少条、上下文压缩过没有」对排查问题仍然有用。
+   */
   private async feishuStatusText(): Promise<string> {
-    const s = this.repo.status();
-    if (s.fileCount === 0) {
-      return "这个会话还没有仓库。发 /repo owner/name 导入一个，比如 /repo sindresorhus/is-stream。";
-    }
-    const kb = s.totalBytes < 1024 ? `${s.totalBytes}B` : `${Math.round(s.totalBytes / 1024)}KB`;
+    const compacted = this.state?.compactCalls ?? 0;
     return (
-      `当前仓库 ${s.owner}/${s.name}@${s.ref}\n` +
-      `${s.fileCount} 个文件 · ${kb}` +
-      (s.capped ? "\n（因为体积上限，只有部分文件进了索引）" : "")
+      `会话 ${this.ctx.id.name ?? "(未知)"}\n` +
+      `对话消息 ${this.messages.length} 条\n` +
+      (compacted > 0 ? `上下文已压缩 ${compacted} 次` : "上下文还没触发过压缩")
     );
   }
 
@@ -716,13 +630,12 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
 
     if (kind === 5) {
       // 直接跑一个工具，不经过模型 —— 确定性验证用。
-      // 走的是和模型完全相同的代码路径（同一批 make*Tools + 同一个 repo）。
+      // 走的是和模型完全相同的代码路径（同一批 make*Tools）。
       // 沙箱工具也在这里查得到，否则 run_python 只能靠模型触发，而本机
       // `wrangler tail` 抓不到日志，线上出问题就完全没有观测手段。
       const p = (payload ?? {}) as { tool?: string; args?: unknown };
       const tools = {
-        ...makeWorkspaceTools(this.repo),
-        ...makeSandboxTools(this.repo, this.envRef, this.sandbox),
+        ...makeSandboxTools(this.envRef, this.sandbox),
         // 工作区仓库那一族也放进来。这不是可选项：本机 `wrangler tail` 抓不到任何
         // 日志，这个探针是**唯一**能不经模型就跑一个工具的路子 —— 不放进来，
         // 线上出问题就完全没有观测手段。
@@ -802,38 +715,6 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
       return out;
     }
 
-    if (kind === 7) {
-      // 服务端导入一份语料（`owner/name` 或 `owner/name@ref`），走的是
-      // `serveIngest` —— 和飞书 `/repo` 命令**同一条**路径。
-      //
-      // 为什么需要它：网页那条导入是浏览器驱动的四步（begin → tarball →
-      // ingest → finish），想给某个 DO 实例塞语料做验证，从外面驱动就得自己
-      // 解一遍 tarball；而这里没有别的入口能触发服务端导入。
-      const p = (payload ?? {}) as { args?: { repo?: string; ref?: string } };
-      const spec = String(p.args?.repo ?? "").trim();
-      const m = /^([\w.-]+)\/([\w.-]+?)(?:@(.+))?$/.exec(spec);
-      if (!m) {
-        return { ...out, error: "args.repo 需要 owner/name 或 owner/name@ref" };
-      }
-      const t0 = Date.now();
-      try {
-        // ⚠️ 默认分支**必须由调用方解析**：serveIngest 拿空 ref 会直接判
-        // 「分支名含非法字符」（它的 REF_RE 要求 ≥1 字符）。飞书那条路是在
-        // turn.ts 里先 resolveDefaultBranch 的，这里照做，别指望 serveIngest 兜。
-        const ref =
-          (m[3] ?? "").trim() ||
-          (await resolveDefaultBranch(m[1], m[2]));
-        out.ref = ref;
-        out.ingest = await serveIngest(this.repo, m[1], m[2], ref);
-        this.syncWorkspaceState();
-      } catch (e) {
-        out.error = `导入失败：${(e as Error).message}`;
-      }
-      out.ms = Date.now() - t0;
-      out.status = this.repo.status();
-      return out;
-    }
-
     if (kind === 0) {
       // 能力探测：本地 workerd 有 FTS5 和 trigram，但线上 DO 是另一套后端
       try {
@@ -848,7 +729,6 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
       } catch (e) {
         out.instr = `失败：${(e as Error).message}`;
       }
-      out.status = this.repo.status();
     } else if (kind === 1) {
       // CPU 天花板：跑**固定迭代次数**，与时钟无关。
       //
@@ -870,18 +750,10 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
       out.acc = acc;
       out.sameClock = out.ms === 0;
       out.note = "跑完 ⇒ 这份 CPU 量在预算内；被杀 ⇒ 超了。sameClock=true 说明同步块里时钟确实没走";
-    } else if (kind === 2) {
-      // SQL 侧全表扫描是否计入 CPU
-      const gen = this.repo.activeGeneration();
-      const t = Date.now();
-      const rows =
-        this.sql`select count(*) as c from repo_files where generation = ${gen} and instr(content, 'zzz') > 0`;
-      out.ms = Date.now() - t;
-      out.gen = gen;
-      out.rows = rows[0]?.c ?? 0;
-      out.note = "耗时很低 ⇒ SQL 扫描基本不计 CPU，永远不需要 FTS5";
     } else if (kind === 3) {
-      // 5MB 解压要花多少 —— 量化「把解码挪到浏览器」这个决定省下了什么
+      // gzip 解压 5MB 要花多少 CPU。**只做量具用** —— 原先它服务于
+      // 「把解码挪到浏览器」那个决定（仓库导入走浏览器解 tarball），
+      // 那条链路 2026-09-25 已删，这个探针留着当通用 CPU 基准。
       const raw = new Uint8Array(5 * 1024 * 1024);
       const gz = await new Response(
         new Blob([raw]).stream().pipeThrough(new CompressionStream("gzip")),
@@ -893,18 +765,11 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
       out.ms = Date.now() - t;
       out.in = raw.byteLength;
       out.out = back.byteLength;
-      out.note = "若这一步很贵，说明浏览器侧解码是必须的，不是优化";
-    } else if (kind === 4) {
-      // 游标是否惰性吐行。rowsRead 远小于文件总数 ⇒ 惰性，grep 的提前收手能省下真金白银
-      const cur = this.repo.fileCursor("");
-      const first = cur.next();
-      out.done = first.done === true;
-      out.rowsRead = cur.rowsRead;
-      out.totalFiles = this.repo.status().fileCount;
-      out.note = "rowsRead ≈ totalFiles ⇒ 结果集被全量物化，grep 的预算必须写进 where 子句";
+      out.note = "5MB gzip 解压耗时；很贵的话说明这类工作不该放在 Worker 里做";
     } else {
       out.error =
-        "未知的探针类型（0-4 见上；5 = 直接跑一个工具；6 = 跑一轮模型回合；7 = 服务端导入语料）";
+        "未知的探针类型（0 = FTS5/instr 能力；1 = CPU 天花板；3 = gzip 解压基准；" +
+        "5 = 直接跑一个工具；6 = 跑一轮模型回合）";
     }
 
     this.setState({ ...this.state, probe: out });
@@ -912,15 +777,9 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
   }
 
   async onChatMessage() {
-    const st = this.repo.status();
-    const hasRepo = st.status === "ready" && st.fileCount > 0;
-
-    // 把实时状态拼进 system，省得模型瞎猜仓库里有什么
-    const base = hasRepo
-      ? `${SYSTEM_PROMPT}\n\n当前已导入仓库 ${st.owner}/${st.name}@${st.ref}，` +
-        `共 ${st.fileCount} 个文件（约 ${Math.round(st.totalBytes / 1024)}KB）。` +
-        (st.capped ? "注意：因为体积上限，只有部分文件进了索引。" : "")
-      : `${SYSTEM_PROMPT}\n\n当前还没有导入代码仓库。如果用户问的是仓库里的代码，先提醒他用 /repo owner/name 导入。`;
+    // 2026-09-25：这里原先会拼一段「当前已导入仓库 owner/name@ref，共 N 个文件」——
+    // 仓库层删掉后没有这个状态可拼了，system 就是纯人格提示词。
+    const base = SYSTEM_PROMPT;
 
     // 沙箱里注入了模型凭证时，把**怎么用它**一并说清楚。
     //
@@ -934,22 +793,15 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
         "可用的模型如 `deepseek-v4.1-flash`、`mimo-v2.5`。"
       : "";
 
-    // 飞书会话（实例名 `fs-` 开头）的回答是走**流式卡片**发的，而卡片**渲染 Markdown**。
-    //
-    // ⚠️ 这里以前写的是反过来的：那会儿回答走 `text` 消息，飞书不渲染 Markdown，
-    // 于是要求模型别用反引号和代码围栏。换成卡片之后那条限制就成了纯粹的自缚 ——
-    // 引用代码正是这个产品的主业，平铺反而难读。
-    //
-    // 唯一保留的约束是**宽表格**：卡片在手机上的宽度很窄，宽表格要横向滚动才看得全。
     // 工作区仓库那一族工具。**只在真配了凭证时才说** —— 提一个模型手上没有的工具，
     // 它就会去调，然后拿到「没有这个工具」，白烧一轮。
+    //
+    // 2026-09-25：这段原先有一大段「它和 read/ls/grep/find 是两个完全不同的仓库，
+    // 不要交叉」的辨析 —— 那四个只读工具已随仓库层删除，所以那段辨析也删了。
     const wsHint = this.ghworkspace
       ? `\n\n你在 GitHub 上有一个**工作区仓库** \`${this.ghworkspace.repo}\`（私有），` +
         "用 ws_ls / ws_read / ws_write / ws_rm 读写。" +
-        "⚠️ 它和 `read`/`ls`/`grep`/`find` 是两个**完全不同的仓库**：" +
-        "那四个读的是**用户导入的**代码快照（只读、存在本地、别人的代码）；" +
-        "ws_* 读写的是**你自己的**工作区仓库（可写、在 GitHub 上、每次写都是一次真实 commit，用户看得见）。" +
-        "要读哪个就用哪个的工具，**不要交叉**。" +
+        "它是你自己的记事本，可写，每次写都是一次真实 commit（用户看得见）。" +
         "值得跨会话保留的产出（结论、笔记、脚本、清单）写进工作区；只在这一次回答里用到的草稿留在正文里，不要为草稿制造 commit。" +
         "覆盖已有文件前先用 ws_read 看一眼现状，别盖掉别人的改动。" +
         "⚠️ **绝对不要把密钥、token、密码、cookie、.env 内容写进工作区仓库** —— " +
@@ -957,11 +809,16 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
         "要写配置就用占位符（如 ${OPENCODE_API_KEY}）并在正文里说明那是占位符。"
       : "";
 
+    // 飞书会话（实例名 `fs-` 开头）的回答是走**流式卡片**发的，而卡片**渲染 Markdown**。
+    //
+    // ⚠️ 这里以前写的是反过来的：那会儿回答走 `text` 消息，飞书不渲染 Markdown，
+    // 于是要求模型别用反引号和代码围栏。换成卡片之后那条限制就成了纯粹的自缚。
+    //
+    // 唯一保留的约束是**宽表格**：卡片在手机上的宽度很窄，宽表格要横向滚动才看得全。
     const system =
       (this.isFeishuChannel
         ? base +
           "\n\n注意：回答会显示在飞书的卡片里，**支持 Markdown** —— 代码块、`行内代码`、列表、加粗都能正常渲染。" +
-          "引用代码时用代码块并标出行号，行内提到标识符用反引号，比平铺更好读。" +
           "只有一个要避开：**别用宽表格**（手机上的卡片很窄，宽表格要横向滚动才看得全），需要对比时改用列表。回答尽量短。"
         : base) + llmHint + wsHint;
 
@@ -973,8 +830,7 @@ export class ChatAgent extends AIChatAgent<Env, ChatState> {
       maxOutputTokens: MAX_OUTPUT_TOKENS,
       tools: {
         ...makeTools(this.env),
-        ...makeWorkspaceTools(this.repo),
-        ...makeSandboxTools(this.repo, this.envRef, this.sandbox),
+        ...makeSandboxTools(this.envRef, this.sandbox),
         ...makeGithubTools(this.ghworkspace),
       },
       // 允许"ls → read → grep → 答"这种多步；不设就是一步，工具调完就停
@@ -1114,11 +970,8 @@ export default {
     }
 
     // ── 门内的请求 ──────────────────────────────────────────────────
-    // /api/workspace/* 先接走。它和 /agents/:binding/:name 不冲突，
-    // 而且 tarball 的流式转发不该进 DO（不占它的 CPU 和 duration）
-    const api = await handleWorkspaceRoutes(request, env);
-    if (api) return api;
-
+    // 2026-09-25：这里原先先接走 `/api/workspace/*`（浏览器驱动的仓库导入协议）。
+    // 仓库层删除后那条路由也没了，直接进 agents 路由。
     const agentRes = await routeAgentRequest(request, env);
     if (agentRes) return agentRes;
 

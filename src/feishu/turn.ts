@@ -2,16 +2,18 @@
 //
 // 跑在 DO 的 `schedule()` 作业里，**不在** webhook 请求里 —— 飞书那边早就 ACK 过了。
 //
-// 这里的 host 接口只有三个方法，不是过度抽象：turn 需要的宿主能力确实就这三样
-// （问模型、导仓库、报状态），而把它们留在 server.ts 里会让那个文件继续膨胀。
+// 这里的 host 接口只有两个方法，不是过度抽象：turn 需要的宿主能力确实就这两样
+// （问模型、报状态），而把它们留在 server.ts 里会让那个文件继续膨胀。
 // 同时这让整个回合流程可以脱离 DO 单独测。
+//
+// 2026-09-25：agent 改成通用助手后去掉了第三个方法 `ingest`（抓取并入库 GitHub 仓库）
+// —— 那整条「导入仓库再问答」的链路已删除。
 
 import { sendText } from "./api.ts";
 import type { FeishuEnv } from "./api.ts";
 import { HELP_TEXT, parseCommand } from "./commands.ts";
 import type { FeishuStore } from "./store.ts";
 import type { FeishuQueueEvent } from "./router.ts";
-import { resolveDefaultBranch } from "../workspace/github.ts";
 
 export interface FeishuTurnHost {
   /**
@@ -25,9 +27,7 @@ export interface FeishuTurnHost {
     messageId: string,
     chatId: string,
   ): Promise<{ text: string; streamed: boolean }>;
-  /** 抓取并入库，返回一句给用户看的回执 */
-  ingest(owner: string, name: string, ref: string): Promise<string>;
-  /** 「当前导入了什么」的一句话 */
+  /** 「当前会话什么状态」的一句话 */
   statusText(): Promise<string>;
 }
 
@@ -55,41 +55,6 @@ export async function runFeishuTurn(
     case "status":
       await sendText(env, cache, evt.chatId, await host.statusText());
       break;
-
-    case "repo": {
-      let ref = cmd.ref;
-      if (!ref) {
-        try {
-          ref = await resolveDefaultBranch(cmd.owner, cmd.name);
-        } catch (e) {
-          // 这一步失败是**永久性**的（仓库不存在/私有），直接说清楚，别重试
-          await sendText(
-            env,
-            cache,
-            evt.chatId,
-            `${(e as Error).message}\n\n确认一下链接，或者显式写分支：/repo ${cmd.owner}/${cmd.name}@main`,
-          );
-          break;
-        }
-      }
-
-      // 抓取可能要几十秒。先给一条回执，否则用户不知道有没有收到
-      await sendText(
-        env,
-        cache,
-        evt.chatId,
-        `正在抓取 ${cmd.owner}/${cmd.name}@${ref} …`,
-      );
-
-      let reply: string;
-      try {
-        reply = await host.ingest(cmd.owner, cmd.name, ref);
-      } catch (e) {
-        reply = `导入失败：${(e as Error).message}`;
-      }
-      await sendText(env, cache, evt.chatId, reply);
-      break;
-    }
 
     case "ask": {
       let reply: string;

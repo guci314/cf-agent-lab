@@ -1,11 +1,12 @@
 // `run_python` —— 把一段 Python 丢到外部沙箱里跑，拿回 stdout/stderr。
 //
-// 和 workspace 那四个只读工具不同，这个**不依赖仓库**：没有导入代码仓库时
-// 照样能用来验算。只有 `files` 参数需要仓库（把仓库里的文件喂进沙箱）。
+// 2026-09-25：原先它还有一个 `files` 参数，用来把**用户导入的仓库**里的文件
+// 复制进沙箱工作目录。agent 改成通用助手、仓库层删除后，没有「导入的仓库」可取，
+// 这个参数连同它对 `WorkspaceRepo` 的依赖一起去掉了 —— 沙箱现在完全不依赖仓库，
+// 脚本要用数据就在脚本里自己生成，或先用 web_search / fetch_page 取。
 
 import { jsonSchema, tool } from "ai";
-import type { WorkspaceRepo } from "../workspace/repo.ts";
-import { guarded } from "../workspace/tools.ts";
+import { guarded } from "../shared/util.ts";
 import { judge0Run } from "./judge0.ts";
 import { executorRun } from "./executor.ts";
 import type { WarmSandbox } from "./warm.ts";
@@ -17,10 +18,6 @@ const DEFAULT_LANGUAGE_ID = 113;
 
 const CODE_MAX_BYTES = 64_000;
 const STDIN_MAX_BYTES = 16_000;
-const STAGE_MAX_FILES = 8;
-// 仓库摄入时单文件已卡在 128KB，这里卡的是「一次送几个」的总量。
-// 实测 4MB 的请求体对端照收，所以这个上限是保守值，不是平台限制。
-const STAGE_MAX_TOTAL_BYTES = 1_000_000;
 // 和 grep 的输出上限对齐：一次工具调用吃掉 16KB 已经很多了
 const OUT_MAX_BYTES = 16_000;
 // 公共实例的墙钟上限是 30 秒，CPU 上限 20 秒。这里取小值 ——
@@ -161,7 +158,10 @@ function hintFor(r: RunResult, cfg: ReturnType<typeof sandboxConfig>): string | 
     return "沙箱的网络是关闭的，这里的代码发不出任何请求。要取外部资料改用 fetch_page / web_search。";
   }
   if (/FileNotFoundError/.test(all)) {
-    return "文件不存在。只有 files 参数里列出的仓库文件会被放进工作目录，用相对路径按原名读。";
+    return (
+      "文件不存在。沙箱的工作目录是空的 —— 没有文件会被预先放进去，" +
+      "脚本要用的数据得自己在脚本里生成，或者把内容直接写进脚本。"
+    );
   }
   return undefined;
 }
@@ -205,7 +205,6 @@ function describeBackend(cfg: ReturnType<typeof sandboxConfig>): string {
 }
 
 export function makeSandboxTools(
-  repo: WorkspaceRepo,
   env: SandboxEnv,
   /** 配了阿里云沙箱时由 ChatAgent 注入；没有则退回 Judge0 / 执行器 */
   warm: WarmSandbox | null,
@@ -216,7 +215,6 @@ export function makeSandboxTools(
     "不是用来跑用户项目的测试套件。\n" +
     "⚠️ 先看下面几条约束，不知道就会白跑一轮：\n" +
     describeBackend(cfg) +
-    "files 里列出的仓库文件会以原名出现在工作目录，用 open() / csv.reader 按相对路径读。" +
     `超时 ${WALL_TIME_LIMIT} 秒；stdout/stderr 各自超过 ${OUT_MAX_BYTES} 字节会被截断，截断处有说明。\n` +
     "脚本失败不会报错，而是返回 ok=false 加 status / stderr / message，据此判断。";
 
@@ -226,7 +224,6 @@ export function makeSandboxTools(
       inputSchema: jsonSchema<{
         code: string;
         stdin?: string;
-        files?: string[];
       }>({
         type: "object",
         properties: {
@@ -238,18 +235,11 @@ export function makeSandboxTools(
             type: "string",
             description: "喂给脚本的标准输入（会被 sys.stdin 读到），可省略",
           },
-          files: {
-            type: "array",
-            items: { type: "string" },
-            description:
-              "要放进沙箱工作目录的仓库内相对路径（如 data/sample.csv），最多 8 个。" +
-              "只有确实要用文件内容时才列，列了会原样复制进去。",
-          },
         },
         required: ["code"],
         additionalProperties: false,
       }),
-      execute: async ({ code, stdin, files }) =>
+      execute: async ({ code, stdin }) =>
         guarded(async () => {
           if (!cfg.enabled) {
             return { error: "沙箱已被关闭（SANDBOX_ENABLED=0），无法执行代码。" };
@@ -267,51 +257,9 @@ export function makeSandboxTools(
             return { error: `stdin 过长（上限 ${STDIN_MAX_BYTES} 字节）` };
           }
 
-          // ── 把仓库文件取出来 ──────────────────────────────────────
-          const wanted = Array.isArray(files)
-            ? files.map((f) => String(f ?? "").trim()).filter(Boolean)
-            : [];
-          if (wanted.length > STAGE_MAX_FILES) {
-            return { error: `files 最多 ${STAGE_MAX_FILES} 个，收到 ${wanted.length} 个` };
-          }
-
-          const staged: { name: string; data: Uint8Array }[] = [];
-          let stagedBytes = 0;
-          if (wanted.length > 0) {
-            const st = repo.status();
-            if (st.activeGeneration === 0 || st.fileCount === 0) {
-              return {
-                error:
-                  "还没有导入代码仓库，files 无从取文件。" +
-                  "要么先用 /repo owner/name 导入，要么去掉 files 参数直接跑代码。",
-              };
-            }
-            for (const raw of wanted) {
-              const p = raw.replace(/^\.\/+/, "").replace(/^\/+/, "");
-              const row = repo.readFile(p);
-              if (!row) {
-                return {
-                  error: `文件不存在：${p}。用 ls / find 确认路径后再列进来。`,
-                };
-              }
-              const data = new TextEncoder().encode(row.content);
-              stagedBytes += data.length;
-              if (stagedBytes > STAGE_MAX_TOTAL_BYTES) {
-                return {
-                  error: `files 总大小超过上限（${STAGE_MAX_TOTAL_BYTES} 字节）。` +
-                    "减少文件数，或只挑真正需要的那一段。",
-                };
-              }
-              // zip 里用 basename：Judge0 会把条目解到工作目录，
-              // 带目录的路径（data/a.csv）解出来通常不建中间目录。
-              staged.push({ name: p.split("/").pop() ?? p, data });
-            }
-          }
-
           const request = {
             code: src,
             stdin: inText || undefined,
-            files: staged.length > 0 ? staged : undefined,
             cpuTimeLimit: CPU_TIME_LIMIT,
             wallTimeLimit: WALL_TIME_LIMIT,
             memoryLimitKb: MEMORY_LIMIT_KB,
@@ -321,7 +269,6 @@ export function makeSandboxTools(
             ? await warm.run({
                 code: src,
                 stdin: inText || undefined,
-                files: staged.length > 0 ? staged : undefined,
                 timeoutMs: SCRIPT_TIMEOUT_MS,
               })
             : cfg.executor
