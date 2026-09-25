@@ -51,7 +51,7 @@ const ACK = () => json({ code: 0 });
 
 /**
  * conversation_id 算法必须**永远不变**：同一个 chat_id 必须落到同一个
- * EdgeOne 会话实例上，否则记忆和语料就串了。平台限制 6~36 字符。
+ * EdgeOne 会话实例上，否则两个群的对话记忆就串了。平台限制 6~36 字符。
  * （EdgeOne 侧本地调试也用这个算法，改了要对齐两边。）
  */
 function conversationIdFor(chatId: string): string {

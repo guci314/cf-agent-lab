@@ -28,8 +28,8 @@
   --radius-ctl: 3px;
   --radius-sheet: 10px;
 
-  /* 中文字体子集动辄 5–10MB，而本应用的语料上限才 4MB —— 为 UI 加载
-     比内容还大的字体不合理。所以用系统栈，这是取舍不是偷懒。 */
+  /* 中文字体子集动辄 5–10MB —— 为这个界面加载比页面本身还大的字体不合理。
+     所以用系统栈，这是取舍不是偷懒。 */
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
     "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
@@ -101,7 +101,7 @@ body {
 
 /* ── 顶栏 ─────────────────────────────────────────────────────────────
    副标题只说一件事：这个页面是干什么的。不列工具名、不写技术栈——
-   「read / ls / grep / find」是实现的词汇，不是用户的词汇。 */
+   工具名是实现的词汇，不是用户的词汇。 */
 header { flex: 0 0 auto; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
 h1 { font-size: 18px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
 .sub { color: var(--ink-soft); font-size: 12.5px; }

@@ -65,8 +65,8 @@ async function usageError<T>(fn: () => Promise<T>): Promise<T | { error: string 
 
 const REPO_FRAMING =
   "**工作区仓库** —— 你在 GitHub 上的私有仓库，可读写，每次写都是一次真实的 commit。" +
-  "⚠️ 这**不是**用户导入的代码仓库：读导入的代码用 read / ls / grep / find。" +
-  "两个仓库内容完全不同，不要交叉使用。";
+  "⚠️ 它是**你自己的记事本**，不是用户的项目仓库 —— 里面只有你自己写过的内容。" +
+  "不要假设里面有别的东西，想确认就先 ws_ls。";
 
 export function makeGithubTools(cfg: GhWorkspaceConfig | null) {
   // 没配凭证就一个工具都不挂 —— 挂出来只会让模型反复试用一个必然失败的工具
