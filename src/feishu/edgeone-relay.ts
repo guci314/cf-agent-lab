@@ -26,9 +26,14 @@ import { decryptEvent, verifySignature } from "./crypto.ts";
 import { parseMessageEvent, readChallenge, readEnvelope } from "./event.ts";
 
 export interface EdgeOneRelayEnv {
-  /** 「代码仓库助手」应用的 Verification Token */
+  /**
+   * EdgeOne 那个 bot 的飞书应用的 Verification Token。
+   *
+   * ⚠️ 它在飞书后台里的应用名是**「代码仓库助手」**（改定位时没跟着改）——
+   * 这里是**引用那个外部应用的名字**，不是本项目的定位描述，别顺手改掉。
+   */
   EO_BOT_VERIFICATION_TOKEN?: string;
-  /** 「代码仓库助手」应用的 Encrypt Key */
+  /** 同上，那个飞书应用的 Encrypt Key */
   EO_BOT_ENCRYPT_KEY?: string;
   /** EdgeOne agents 路由的公网地址 */
   EO_AGENT_URL?: string;

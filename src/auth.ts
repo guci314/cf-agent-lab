@@ -129,12 +129,12 @@ export function loginPage(error?: string): Response {
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-<title>需要密码 · 代码仓库问答</title>
+<title>需要密码 · 通用助手</title>
 <style>${PAGE_CSS}</style>
 </head>
 <body>
 <form method="POST" action="/login">
-  <h1>代码仓库问答</h1>
+  <h1>通用助手</h1>
   <p class="lede">这个页面需要访问密码。</p>
   ${error ? `<p class="err" role="alert">${error}</p>` : ""}
   <input type="password" name="password" inputmode="numeric" autocomplete="current-password"

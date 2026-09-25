@@ -136,7 +136,7 @@ export class FeishuStore {
       .toArray();
   }
 
-  /** 永久失败（比如仓库不存在）。不抛错 → 不触发重试，但要留下现场 */
+  /** 永久失败（比如 404）。不抛错 → 不触发重试，但要留下现场 */
   markFailed(messageId: string, error: string): void {
     this.sql
       .exec(
